@@ -14,6 +14,7 @@
 #include <linux/mmdebug.h>
 #include <linux/rmap.h>
 #include <linux/jiffies.h>
+#include <linux/rhashtable.h>
 
 
 // 어떤 cgroup을 scan할 것인지 알려주는 모듈 패러미터.
@@ -25,6 +26,26 @@ static struct task_struct *kptscand;
 
 extern int folio_referenced(struct folio *folio, int is_locked,
 				struct mem_cgroup *memcg, unsigned long *vm_flags);
+
+// page 접근 횟수 카운터 구조체 (hash table entry)
+struct access_counter {
+	unsigned long pfn; // key
+	unsigned long count; // value
+	struct rhash_head node;
+};
+
+// (pfn, count) 엔트리들을 저장하는 해시 테이블
+struct rhashtable count_table; 
+struct rhashtable_params params = {
+	.head_offset = offsetof(struct access_counter, node),
+	.key_offset = offsetof(struct access_counter, pfn),
+	.key_len = sizeof(unsigned long),
+	.automatic_shrinking = true,
+};
+static void rh_free_fn(void* ptr, void *arg)
+{
+	kfree(ptr);
+}
 
 // mm/vmscan.c에 존재하는 같은 이름의 함수를 거의 그대로 복사한 함수.
 static void move_folios_to_lru(struct lruvec *lruvec,
@@ -136,9 +157,35 @@ static void folio_list_pt_scan(struct list_head *folio_list, struct mem_cgroup *
 		struct folio *folio = list_entry(pos, struct folio, lru);
 		int referenced_ptes = 0;
 		unsigned long vm_flags;
+		struct page *page = folio_page(folio, 0);
+		unsigned long pfn = page_to_pfn(page);
+		struct access_counter *counter = NULL;
+		int err;
 
 		referenced_ptes = folio_referenced(folio, 0, memcg, &vm_flags);	
 		total_refs += referenced_ptes;
+
+		counter = rhashtable_lookup_fast(&count_table, &pfn, params);
+
+		if (!counter) {
+			counter = kmalloc(sizeof(*counter), GFP_KERNEL);
+			if (!counter) {
+				pr_err("Failed to kmalloc counter");
+				continue;
+			}
+
+			counter->pfn = pfn;
+			counter->count = 0;
+
+			err = rhashtable_insert_fast(&count_table, &counter->node, params);	
+			if (err) {
+				kfree(counter);
+				pr_err("Failed to insert counter obj");
+				continue;
+			}
+		} else {
+			counter->count += 1;
+		}
 	}
 	end = jiffies;
 	elapsed = end - start;
@@ -253,9 +300,17 @@ static int kptscand_main(void *data)
 
 static int __init pt_scanner_init(void)
 {
+	
+	int ret = rhashtable_init(&count_table, &params);
+	if (ret) {
+		pr_err("Failed to create rhashtable\n");
+		return 0;
+	}
+
 	kptscand = kthread_run(kptscand_main, NULL, "kptscand");
 	if (IS_ERR(kptscand)) {
 		pr_err("Failed to create kptscand\n");
+		rhashtable_destroy(&count_table);
 		return PTR_ERR(kptscand);
 	}
 	return 0;
@@ -264,6 +319,8 @@ static int __init pt_scanner_init(void)
 static void __exit pt_scanner_exit(void)
 {
 	kthread_stop(kptscand);	
+
+	rhashtable_free_and_destroy(&count_table, rh_free_fn, NULL);
 }
 
 module_init(pt_scanner_init);

@@ -15,6 +15,7 @@
 #include <linux/rmap.h>
 #include <linux/jiffies.h>
 #include <linux/rhashtable.h>
+#include <linux/list.h>
 
 
 // 어떤 cgroup을 scan할 것인지 알려주는 모듈 패러미터.
@@ -31,8 +32,23 @@ extern int folio_referenced(struct folio *folio, int is_locked,
 struct access_counter {
 	unsigned long pfn; // key
 	unsigned long count; // value
+	int bucket_idx; //bucket index
 	struct rhash_head node;
+	struct list_head list;
 };
+
+#define NR_BUCKETS 8
+#define MAX_COUNT 255 // 2^NR_BUCKETS - 1
+// bucket 0: 1 <= n < 2
+// bucket 1: 2 <= n < 4
+// bucket m: 2^m <= n < 2^(m+1)
+struct bucket_sort {
+	unsigned long counts[NR_BUCKETS];
+	struct list_head buckets[NR_BUCKETS];
+};
+
+// bucket sort를 위한 bucket_sort 구조체
+struct bucket_sort bucket_sort;
 
 // (pfn, count) 엔트리들을 저장하는 해시 테이블
 struct rhashtable count_table; 
@@ -175,7 +191,8 @@ static void folio_list_pt_scan(struct list_head *folio_list, struct mem_cgroup *
 			}
 
 			counter->pfn = pfn;
-			counter->count = 0;
+			counter->count = 1;
+			INIT_LIST_HEAD(&counter->list);
 
 			err = rhashtable_insert_fast(&count_table, &counter->node, params);	
 			if (err) {
@@ -183,8 +200,30 @@ static void folio_list_pt_scan(struct list_head *folio_list, struct mem_cgroup *
 				pr_err("Failed to insert counter obj");
 				continue;
 			}
+
+			// bucket에 삽입.
+			list_add(&counter->list, &bucket_sort.buckets[0]);
+			bucket_sort.counts[0]++;
+			counter->bucket_idx = 0;
 		} else {
-			counter->count += 1;
+			// MAX_COUNT 초과하면 덧셈 X
+			if (counter->count < MAX_COUNT)
+				counter->count += 1;
+
+			// bucket을 옮겨야 하는 지 판단 후 상황에 맞게 진행
+			if (counter->count < (1 << counter->bucket_idx) ||
+				counter->count >= (1 << (counter->bucket_idx+1))) {
+				bucket_sort.counts[counter->bucket_idx] -= 1;
+				for (int i = 0; i < NR_BUCKETS; i++) {
+					if (counter->count >= (1 << i) &&
+						counter->count < (1 << (i+1))) {
+						counter->bucket_idx = i;
+						list_del(&counter->list);
+						list_add(&counter->list, &bucket_sort.buckets[i]);
+						bucket_sort.counts[i] += 1;
+					}
+				}
+			}
 		}
 	}
 	end = jiffies;
@@ -192,6 +231,9 @@ static void folio_list_pt_scan(struct list_head *folio_list, struct mem_cgroup *
 	pr_info("pt_scan result: ");
 	pr_info("-- total accesses: %d", total_refs);
 	pr_info("-- elapsed time (s): %lu/%u", elapsed, HZ);
+	for (int i=0; i < NR_BUCKETS; i++) {
+		pr_info("-- bucket[%d] count: %lu", i, bucket_sort.counts[i]);
+	}
 }
 
 // lruvec의 모든 list에 포함된 모든 page에 대해 pt_scan 수행.
@@ -300,8 +342,14 @@ static int kptscand_main(void *data)
 
 static int __init pt_scanner_init(void)
 {
+	int ret;
+	// bucket sort 자료구조 초기화
+	for (int i = 0; i < NR_BUCKETS; i++) {
+		bucket_sort.counts[i] = 0;
+		INIT_LIST_HEAD(&bucket_sort.buckets[i]);
+	}
 	
-	int ret = rhashtable_init(&count_table, &params);
+	ret = rhashtable_init(&count_table, &params);
 	if (ret) {
 		pr_err("Failed to create rhashtable\n");
 		return 0;

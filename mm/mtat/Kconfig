@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+menu "Multi-Tenant-Aware Tiering"
+
+config MTAT
+	bool "MTAT: Multi-Tenant-Aware Tiering"
+	help
+	  This builds a tiered-memory management system that is aware multi-tenancy.
+
+endmenu

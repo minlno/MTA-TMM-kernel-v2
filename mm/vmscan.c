@@ -2241,7 +2241,7 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
  * Update LRU sizes after isolating pages. The LRU size updates must
  * be complete before mem_cgroup_update_lru_size due to a sanity check.
  */
-static __always_inline void update_lru_sizes(struct lruvec *lruvec,
+void update_lru_sizes(struct lruvec *lruvec,
 			enum lru_list lru, unsigned long *nr_zone_taken)
 {
 	int zid;
@@ -2461,7 +2461,7 @@ static int too_many_isolated(struct pglist_data *pgdat, int file,
  *
  * Returns the number of pages moved to the given lruvec.
  */
-static unsigned int move_folios_to_lru(struct lruvec *lruvec,
+unsigned int move_folios_to_lru(struct lruvec *lruvec,
 		struct list_head *list)
 {
 	int nr_pages, nr_moved = 0;

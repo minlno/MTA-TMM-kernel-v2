@@ -22,6 +22,8 @@
 #include <linux/jiffies.h>
 #include <linux/rhashtable.h>
 #include <linux/list.h>
+#include <linux/pagewalk.h>
+#include <linux/mmu_notifier.h>
 
 #include "../internal.h"
 #include "ptscan.h"
@@ -53,6 +55,7 @@ int ptscan_start(struct ptscan_ctx *ctx)
 {
 	int err = -EBUSY;
 
+	mutex_lock(&ptscan_lock);
 	mutex_lock(&ctx->kptscand_lock);
 	if (!ctx->kptscand) {
 		err = 0;
@@ -63,7 +66,9 @@ int ptscan_start(struct ptscan_ctx *ctx)
 			ctx->kptscand = NULL;
 		}
 	}
+	nr_running_ctxs++;
 	mutex_unlock(&ctx->kptscand_lock);
+	mutex_unlock(&ptscan_lock);
 
 	return err;
 }
@@ -87,7 +92,7 @@ int ptscan_stop(struct ptscan_ctx *ctx)
 }
 
 #define NR_BUCKETS 8
-#define MAX_COUNT 255 // 2^NR_BUCKETS -1
+#define MAX_COUNT 8
 struct access_counter {
 	unsigned long pfn; // key
 	unsigned long count; // value
@@ -98,10 +103,13 @@ struct access_counter {
 
 static struct access_counter *new_access_counter(unsigned long pfn)
 {
-	struct access_counter *counter;
+	struct access_counter *counter = NULL;
 	counter = kmalloc(sizeof(*counter), GFP_KERNEL);
+	if (!counter)
+		return NULL;
 	counter->pfn = pfn;
 	counter->count = 1;
+	counter->bucket_idx = 0;
 	INIT_LIST_HEAD(&counter->list);
 	return counter;
 }
@@ -115,6 +123,7 @@ static void inc_access_counter(struct access_counter *counter)
 {
 	if (counter->count < MAX_COUNT)
 		counter->count++;
+	pr_info("count: %lu", counter->count);
 }
 
 struct bucket_sort {
@@ -131,10 +140,10 @@ static int get_bucket_index(unsigned long count)
 		count = MAX_COUNT;
 
 	for (i = 0; i < NR_BUCKETS; i++) {
-		if (count >= (1 << i) && count < (1 << (i+1)))
+		if (count > i && count <= (i+1))
 			break;
 	}
-
+	pr_info("bucket_index: %d", i);
 	return i;
 }
 
@@ -150,10 +159,10 @@ static void bucket_init(struct bucket_sort *bucket_sort)
 static void bucket_remove(struct bucket_sort *bucket_sort, struct access_counter *counter)
 {
 	unsigned long count = counter->count;
-	int bucket_idx = get_bucket_index(count);
+	int bucket_idx = counter->bucket_idx;
 
-	bucket_sort->counts[bucket_idx]--;
 	list_del(&counter->list);
+	bucket_sort->counts[bucket_idx]--;
 }
 
 static void bucket_insert(struct bucket_sort *bucket_sort, struct access_counter *counter)
@@ -161,9 +170,9 @@ static void bucket_insert(struct bucket_sort *bucket_sort, struct access_counter
 	unsigned long count = counter->count;
 	int bucket_idx = get_bucket_index(count);
 
+	counter->bucket_idx = bucket_idx;
 	list_add(&counter->list, &bucket_sort->buckets[bucket_idx]);
 	bucket_sort->counts[bucket_idx]++;
-	counter->bucket_idx = bucket_idx;
 }
 
 static void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter)
@@ -191,6 +200,139 @@ static void rh_free_fn(void *ptr, void *arg)
 	kfree(ptr);
 }
 
+/*
+ * PT scan with vaddr
+ */
+
+static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
+					struct mm_walk *walk)
+{
+	unsigned long pfn;
+	struct access_counter *counter = NULL;
+	int err;
+
+	if (!pte_present(*pte))
+		return 0;
+
+	if (ptep_clear_flush_young_notify(walk->vma, addr, pte)) {
+		pfn = pte_pfn(*pte);
+		counter = rhashtable_lookup_fast(&count_table, &pfn, params);
+		if (!counter) {
+			pr_info("pte is young, but no counter");
+			counter = new_access_counter(pfn);
+			if (!counter) {
+				pr_err("Failed to allocate access_counter\n");
+				return 0;
+			}
+			err = rhashtable_insert_fast(&count_table, &counter->node, params);
+			if (err) {
+				destroy_access_counter(counter);
+				pr_err("Failed to insert access_counter into count_table\n");
+				return 0;
+			}
+			bucket_insert(&bucket_sort, counter);
+		} else {
+			pr_info("pte is young, with counter");
+			inc_access_counter(counter);
+
+			bucket_reinsert(&bucket_sort, counter);
+		}
+	}
+
+	return 0;
+}
+
+static const struct mm_walk_ops ptscan_ops = {
+	.pte_entry = ptscan_pte_entry,
+};
+
+static void task_ptscan(struct task_struct *tsk)
+{
+	struct mm_struct *mm = tsk->mm;
+	VMA_ITERATOR(vmi, mm, 0);
+	struct vm_area_struct *vma;
+	unsigned long start, end, elapsed;
+
+
+	start = jiffies;
+	for_each_vma(vmi, vma) {
+		mmap_read_lock(mm);
+		walk_page_vma(vma, &ptscan_ops, NULL);
+		mmap_read_unlock(mm);
+	}
+	end = jiffies;
+	elapsed = end - start;
+	pr_info("pt_scan result: ");
+	//pr_info("-- total accesses: %d", total_refs);
+	pr_info("-- elapsed time (s): %lu/%u", elapsed, HZ);
+	for (int i = 0; i < NR_BUCKETS; i++) {
+		pr_info("-- bucket[%d] count: %lu", i, bucket_sort.counts[i]);
+	}
+}
+
+static int kptscand_fn(void *data)
+{
+	struct ptscan_ctx *ctx = data;
+	struct pid *pid = NULL;
+	struct task_struct *tsk = NULL;
+
+	// TODO: 버킷하고 count_table 초기화 코드 위치 고민하기
+	// 일단 지금은 여기에서 초기화 진행
+	int ret;
+	bucket_init(&bucket_sort);
+	ret = rhashtable_init(&count_table, &params);
+	if (ret) {
+		pr_err("Failed to init rhashtable\n");
+		return 0;
+	}
+
+	while (!kthread_should_stop()) {
+		pr_info("kptscand is running\n");
+
+		ssleep(5);
+
+		pr_info("target_pid: %d\n", ctx->pid);
+
+		if (ctx->pid <= 0)
+			continue;
+
+		if (!tsk) {
+			pid = find_get_pid(ctx->pid);
+			if (!pid) {
+				pr_err("Failed to get pid struct\n");
+				break;
+			}
+			tsk = get_pid_task(pid, PIDTYPE_PID);
+			if (!tsk) {
+				pr_err("Failed to get task struct\n");
+				put_pid(pid);
+				break;
+			}
+			put_pid(pid);
+		}
+
+		task_ptscan(tsk);
+	}
+	if (tsk)
+		put_task_struct(tsk);
+
+	mutex_lock(&ctx->kptscand_lock);
+	ctx->kptscand = NULL;
+	mutex_unlock(&ctx->kptscand_lock);
+
+	mutex_lock(&ptscan_lock);
+	nr_running_ctxs--;
+	mutex_unlock(&ptscan_lock);
+	pr_info("kptscand has stopped\n");
+	return 0;
+}
+/*
+ * PT scan with vaddr End.
+ */
+
+/*
+ * PT scan with cgroup lruvec
+ */
 static unsigned long isolate_lru_all_folios(struct lruvec *lruvec,
 		struct list_head *dst, enum lru_list lru)
 {
@@ -336,7 +478,7 @@ static void memcg_ptscan(struct mem_cgroup *memcg)
 	lruvec_ptscan(lruvec, memcg);
 }
 
-static int kptscand_fn(void *data)
+static int kptscand_fn_cgroup(void *data)
 {
 	struct ptscan_ctx *ctx = data;
 	struct pid *pid = NULL;
@@ -396,3 +538,6 @@ static int kptscand_fn(void *data)
 	pr_info("kptscand has stopped\n");
 	return 0;
 }
+/*
+ * PT scan with cgroup lruvec End.
+ */

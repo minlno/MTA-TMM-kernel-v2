@@ -26,8 +26,6 @@
 
 #include "../internal.h"
 
-struct bucket_sort bucket_sort;
-
 // ptscan 내부 전역 변수 count table로 pfn들의 access count를 저장.
 // kptscand 들끼리 공유함, 따라서 ptscan_lock으로 보호 필요.
 struct rhashtable count_table;
@@ -108,7 +106,7 @@ int ptscan_start(struct ptscan_ctx *ctx)
 		pr_err("Failed to allocate bucket_sort");
 		return -ENOMEM;
 	}
-	bucket_init(&bucket_sort);
+	bucket_init(ctx->target_mm->bucket_sort);
 	mutex_unlock(&ctx->target_mm->bucket_lock);
 
 	// kptscand 시작.
@@ -274,6 +272,11 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 		return 0;
 	}
 
+	if (!pte) {
+		pr_err("PTE pointer is NULL!!!!!");
+		return 0;
+	}
+
 	if (!pte_present(*pte))
 		return 0;
 
@@ -410,6 +413,7 @@ static int kptscand_fn(void *data)
 /*
  * PT scan with cgroup lruvec
  */
+/*
 static unsigned long isolate_lru_all_folios(struct lruvec *lruvec,
 		struct list_head *dst, enum lru_list lru)
 {
@@ -615,6 +619,7 @@ static int kptscand_fn_cgroup(void *data)
 	pr_info("kptscand has stopped\n");
 	return 0;
 }
+*/
 /*
  * PT scan with cgroup lruvec End.
  */

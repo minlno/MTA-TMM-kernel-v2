@@ -99,6 +99,7 @@
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
 #include <linux/iommu.h>
+#include <linux/ptscan.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>
@@ -1311,6 +1312,11 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
+
+#ifdef CONFIG_MTAT
+	mm->bucket_sort = NULL;
+	mutex_init(&mm->bucket_lock);
+#endif
 	return mm;
 
 fail_pcpu:

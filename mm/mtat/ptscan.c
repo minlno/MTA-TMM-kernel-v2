@@ -20,16 +20,27 @@
 #include <linux/mmdebug.h>
 #include <linux/rmap.h>
 #include <linux/jiffies.h>
-#include <linux/rhashtable.h>
-#include <linux/list.h>
 #include <linux/pagewalk.h>
 #include <linux/mmu_notifier.h>
+#include <linux/ptscan.h>
 
 #include "../internal.h"
-#include "ptscan.h"
 
+struct bucket_sort bucket_sort;
+
+// ptscan 내부 전역 변수 count table로 pfn들의 access count를 저장.
+// kptscand 들끼리 공유함, 따라서 ptscan_lock으로 보호 필요.
+struct rhashtable count_table;
+struct rhashtable_params params = {
+	.head_offset = offsetof(struct access_counter, node),
+	.key_offset = offsetof(struct access_counter, pfn),
+	.key_len = sizeof(unsigned long),
+	.automatic_shrinking = true,
+};
+
+static int nr_running_ctxs = 0;
+// nr_running_ctxs, count_table 보호용 락.
 static DEFINE_MUTEX(ptscan_lock);
-static int nr_running_ctxs;
 
 struct ptscan_ctx *ptscan_new_ctx(void)
 {
@@ -50,25 +61,67 @@ void ptscan_destroy_ctx(struct ptscan_ctx *ctx)
 }
 
 static int kptscand_fn(void *data);
+static struct mm_struct *ptscan_get_mm(int target_pid);
+static struct bucket_sort *alloc_bucket_sort(void);
 
 int ptscan_start(struct ptscan_ctx *ctx)
 {
 	int err = -EBUSY;
 
 	mutex_lock(&ptscan_lock);
+	if (!nr_running_ctxs) {
+		err = rhashtable_init(&count_table, &params);
+		if (err) {
+			mutex_unlock(&ptscan_lock);
+			pr_err("Failed to init rhashtable\n");
+			return err;
+		}
+	}
+	nr_running_ctxs++;
+	mutex_unlock(&ptscan_lock);
+
 	mutex_lock(&ctx->kptscand_lock);
+	// pid를 이용하여 mm_struct 획득.
+	ctx->target_mm = ptscan_get_mm(ctx->pid);
+	if (!ctx->target_mm) {
+		pr_err("Failed to get mm_struct");
+		mutex_unlock(&ctx->kptscand_lock);
+		return -EINVAL;
+	}
+	
+	// bucket_sort 할당 진행
+	mutex_lock(&ctx->target_mm->bucket_lock);
+
+	// 이 때, target_mm의 bucket_sort는 무조건 NULL이어야 함.
+	if (ctx->target_mm->bucket_sort) {
+		mutex_unlock(&ctx->target_mm->bucket_lock);
+		mutex_unlock(&ctx->kptscand_lock);
+		pr_err("bucket sort already exists!");
+		return -EINVAL;
+	}
+	
+	// 할당 및 초기화 진행
+	ctx->target_mm->bucket_sort = alloc_bucket_sort();
+	if (!ctx->target_mm->bucket_sort) {
+		mutex_unlock(&ctx->target_mm->bucket_lock);
+		mutex_unlock(&ctx->kptscand_lock);
+		pr_err("Failed to allocate bucket_sort");
+		return -ENOMEM;
+	}
+	bucket_init(&bucket_sort);
+	mutex_unlock(&ctx->target_mm->bucket_lock);
+
+	// kptscand 시작.
 	if (!ctx->kptscand) {
 		err = 0;
 		ctx->kptscand = kthread_run(kptscand_fn, ctx, "kptscand.%d",
-				nr_running_ctxs);
+				nr_running_ctxs-1);
 		if (IS_ERR(ctx->kptscand)) {
 			err = PTR_ERR(ctx->kptscand);
 			ctx->kptscand = NULL;
 		}
 	}
-	nr_running_ctxs++;
 	mutex_unlock(&ctx->kptscand_lock);
-	mutex_unlock(&ptscan_lock);
 
 	return err;
 }
@@ -91,16 +144,9 @@ int ptscan_stop(struct ptscan_ctx *ctx)
 	return -EPERM;
 }
 
-#define NR_BUCKETS 8
-#define MAX_COUNT 8
-struct access_counter {
-	unsigned long pfn; // key
-	unsigned long count; // value
-	int bucket_idx; //bucket index
-	struct rhash_head node;
-	struct list_head list;
-};
-
+/* 
+ * access_counter structure's methods
+ */
 static struct access_counter *new_access_counter(unsigned long pfn)
 {
 	struct access_counter *counter = NULL;
@@ -121,33 +167,41 @@ static void destroy_access_counter(struct access_counter *counter)
 
 static void inc_access_counter(struct access_counter *counter)
 {
-	if (counter->count < MAX_COUNT)
+	if (counter->count < MAX_ACCESS_COUNTER_VALUE)
 		counter->count++;
-	pr_info("count: %lu", counter->count);
 }
 
-struct bucket_sort {
-	unsigned long counts[NR_BUCKETS];
-	struct list_head buckets[NR_BUCKETS];
-};
-struct bucket_sort bucket_sort;
-
+/* 
+ * bucket_sort structure's methods
+ */
 static int get_bucket_index(unsigned long count)
 {
 	int i;
 
-	if (count > MAX_COUNT)
-		count = MAX_COUNT;
+	if (count > MAX_ACCESS_COUNTER_VALUE)
+		count = MAX_ACCESS_COUNTER_VALUE;
 
 	for (i = 0; i < NR_BUCKETS; i++) {
 		if (count > i && count <= (i+1))
 			break;
 	}
-	pr_info("bucket_index: %d", i);
 	return i;
 }
 
-static void bucket_init(struct bucket_sort *bucket_sort)
+static struct bucket_sort *alloc_bucket_sort(void)
+{
+	struct bucket_sort *bucket_sort = NULL;
+	bucket_sort = kmalloc(sizeof(*bucket_sort), GFP_KERNEL);
+	
+	return bucket_sort;
+}
+
+static void destroy_bucket_sort(struct bucket_sort *bucket_sort)
+{
+	kfree(bucket_sort);
+}
+
+void bucket_init(struct bucket_sort *bucket_sort)
 {
 	int i;
 	for (i = 0; i < NR_BUCKETS; i++) {
@@ -156,16 +210,21 @@ static void bucket_init(struct bucket_sort *bucket_sort)
 	}
 }
 
-static void bucket_remove(struct bucket_sort *bucket_sort, struct access_counter *counter)
+/*
+void bucket_remove_page(struct bucket_sort *bucket_sort, struct page *page)
 {
-	unsigned long count = counter->count;
+}
+*/
+
+void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter)
+{
 	int bucket_idx = counter->bucket_idx;
 
 	list_del(&counter->list);
 	bucket_sort->counts[bucket_idx]--;
 }
 
-static void bucket_insert(struct bucket_sort *bucket_sort, struct access_counter *counter)
+void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counter *counter)
 {
 	unsigned long count = counter->count;
 	int bucket_idx = get_bucket_index(count);
@@ -175,7 +234,7 @@ static void bucket_insert(struct bucket_sort *bucket_sort, struct access_counter
 	bucket_sort->counts[bucket_idx]++;
 }
 
-static void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter)
+void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter)
 {
 	unsigned long count = counter->count;
 	int bucket_idx = get_bucket_index(count);
@@ -183,21 +242,18 @@ static void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_count
 	if (bucket_idx == counter->bucket_idx)
 		return;
 	else {
-		bucket_remove(bucket_sort, counter);
-		bucket_insert(bucket_sort, counter);
+		bucket_remove_counter(bucket_sort, counter);
+		bucket_insert_counter(bucket_sort, counter);
 	}
 }
 
-struct rhashtable count_table;
-struct rhashtable_params params = {
-	.head_offset = offsetof(struct access_counter, node),
-	.key_offset = offsetof(struct access_counter, pfn),
-	.key_len = sizeof(unsigned long),
-	.automatic_shrinking = true,
-};
+/* 
+ * count_table structure's methods
+ */
 static void rh_free_fn(void *ptr, void *arg)
 {
-	kfree(ptr);
+	struct access_counter *counter = ptr;
+	destroy_access_counter(counter);
 }
 
 /*
@@ -209,16 +265,23 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 {
 	unsigned long pfn;
 	struct access_counter *counter = NULL;
+	struct mm_struct *mm = walk->mm;
+	struct bucket_sort *bucket_sort = mm->bucket_sort;
 	int err;
+
+	if (!bucket_sort) {
+		pr_err("There is no bucket_sort!!!");
+		return 0;
+	}
 
 	if (!pte_present(*pte))
 		return 0;
 
 	if (ptep_clear_flush_young_notify(walk->vma, addr, pte)) {
 		pfn = pte_pfn(*pte);
+		// rhashtable은 lock 필요없음.
 		counter = rhashtable_lookup_fast(&count_table, &pfn, params);
 		if (!counter) {
-			pr_info("pte is young, but no counter");
 			counter = new_access_counter(pfn);
 			if (!counter) {
 				pr_err("Failed to allocate access_counter\n");
@@ -230,12 +293,16 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 				pr_err("Failed to insert access_counter into count_table\n");
 				return 0;
 			}
-			bucket_insert(&bucket_sort, counter);
+
+			mutex_lock(&mm->bucket_lock);
+			bucket_insert_counter(bucket_sort, counter);
+			mutex_unlock(&mm->bucket_lock);
 		} else {
-			pr_info("pte is young, with counter");
 			inc_access_counter(counter);
 
-			bucket_reinsert(&bucket_sort, counter);
+			mutex_lock(&mm->bucket_lock);
+			bucket_reinsert(bucket_sort, counter);
+			mutex_unlock(&mm->bucket_lock);
 		}
 	}
 
@@ -246,9 +313,8 @@ static const struct mm_walk_ops ptscan_ops = {
 	.pte_entry = ptscan_pte_entry,
 };
 
-static void task_ptscan(struct task_struct *tsk)
+static void mm_ptscan(struct mm_struct *mm)
 {
-	struct mm_struct *mm = tsk->mm;
 	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
 	unsigned long start, end, elapsed;
@@ -265,27 +331,44 @@ static void task_ptscan(struct task_struct *tsk)
 	pr_info("pt_scan result: ");
 	//pr_info("-- total accesses: %d", total_refs);
 	pr_info("-- elapsed time (s): %lu/%u", elapsed, HZ);
+	// TODO: bucket lock 잡기
+	mutex_lock(&mm->bucket_lock);
 	for (int i = 0; i < NR_BUCKETS; i++) {
-		pr_info("-- bucket[%d] count: %lu", i, bucket_sort.counts[i]);
+		pr_info("-- bucket[%d] count: %lu", i, mm->bucket_sort->counts[i]);
 	}
+	mutex_unlock(&mm->bucket_lock);
+}
+
+static struct mm_struct *ptscan_get_mm(int target_pid)
+{
+	struct pid *pid = NULL;
+	struct task_struct *tsk = NULL;
+	struct mm_struct *mm = NULL;
+
+		
+	pid = find_get_pid(target_pid);
+	if (!pid) {
+		pr_err("Failed to get pid struct\n");
+		return NULL;
+	}
+
+	tsk = get_pid_task(pid, PIDTYPE_PID);
+	put_pid(pid);
+	if (!tsk) {
+		pr_err("Failed to get task_struct\n");
+		return NULL;
+	}
+
+	mm = tsk->mm;
+	put_task_struct(tsk);
+
+	return mm;
 }
 
 static int kptscand_fn(void *data)
 {
 	struct ptscan_ctx *ctx = data;
-	struct pid *pid = NULL;
-	struct task_struct *tsk = NULL;
-
-	// TODO: 버킷하고 count_table 초기화 코드 위치 고민하기
-	// 일단 지금은 여기에서 초기화 진행
-	int ret;
-	bucket_init(&bucket_sort);
-	ret = rhashtable_init(&count_table, &params);
-	if (ret) {
-		pr_err("Failed to init rhashtable\n");
-		return 0;
-	}
-
+	
 	while (!kthread_should_stop()) {
 		pr_info("kptscand is running\n");
 
@@ -296,33 +379,27 @@ static int kptscand_fn(void *data)
 		if (ctx->pid <= 0)
 			continue;
 
-		if (!tsk) {
-			pid = find_get_pid(ctx->pid);
-			if (!pid) {
-				pr_err("Failed to get pid struct\n");
-				break;
-			}
-			tsk = get_pid_task(pid, PIDTYPE_PID);
-			if (!tsk) {
-				pr_err("Failed to get task struct\n");
-				put_pid(pid);
-				break;
-			}
-			put_pid(pid);
-		}
-
-		task_ptscan(tsk);
+		mm_ptscan(ctx->target_mm);
 	}
-	if (tsk)
-		put_task_struct(tsk);
+
+	// bucket_sort 메모리 해제 및 mm_struct의 bucket_sort를 NULL로 교체.
+	mutex_lock(&ctx->target_mm->bucket_lock);
+	destroy_bucket_sort(ctx->target_mm->bucket_sort);
+	ctx->target_mm->bucket_sort = NULL;
+	mutex_unlock(&ctx->target_mm->bucket_lock);
 
 	mutex_lock(&ctx->kptscand_lock);
 	ctx->kptscand = NULL;
+	ctx->target_mm = NULL;
 	mutex_unlock(&ctx->kptscand_lock);
 
 	mutex_lock(&ptscan_lock);
 	nr_running_ctxs--;
+	if (!nr_running_ctxs) {
+		rhashtable_free_and_destroy(&count_table, rh_free_fn, NULL);
+	}
 	mutex_unlock(&ptscan_lock);
+
 	pr_info("kptscand has stopped\n");
 	return 0;
 }
@@ -413,7 +490,7 @@ static void folio_list_ptscan(struct list_head *folio_list, struct mem_cgroup *m
 				continue;
 			}
 
-			bucket_insert(&bucket_sort, counter);
+			bucket_insert_counter(&bucket_sort, counter);
 		} else {
 			inc_access_counter(counter);
 

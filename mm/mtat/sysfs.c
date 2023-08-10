@@ -6,9 +6,9 @@
  */
 
 #include <linux/slab.h>
+#include <linux/ptscan.h>
 
 #include "sysfs-common.h"
-#include "ptscan.h"
 
 /*
  * kptscand directory
@@ -239,13 +239,27 @@ static void mtat_sysfs_kptscands_rm_dirs(struct mtat_sysfs_kptscands *kptscands)
 	kptscands->kptscands_arr = NULL;
 }
 
+static bool mtat_sysfs_kptscands_busy(struct mtat_sysfs_kptscand **kptscands,
+		int nr_kptscands)
+{
+	int i;
+
+	for (i = 0; i < nr_kptscands; i++) {
+		if (mtat_sysfs_kptscand_running(kptscands[i]))
+			return true;
+	}
+
+	return false;
+}
+
 static int mtat_sysfs_kptscands_add_dirs(struct mtat_sysfs_kptscands *kptscands,
 		int nr_kptscands)
 {
 	struct mtat_sysfs_kptscand **kptscands_arr, *kptscand;
 	int err, i;
 	
-	// TODO: have to check if kptscand is busy
+	if (mtat_sysfs_kptscands_busy(kptscands->kptscands_arr, kptscands->nr))
+		return -EBUSY;
 
 	mtat_sysfs_kptscands_rm_dirs(kptscands);
 	if (!nr_kptscands)

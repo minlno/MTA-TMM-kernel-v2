@@ -19,6 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
+#include <linux/ptscan.h>
 
 #include <asm/mmu.h>
 
@@ -809,6 +810,10 @@ struct mm_struct {
 #endif
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN */
+#ifdef CONFIG_MTAT
+		struct bucket_sort	*bucket_sort;
+		struct mutex        bucket_lock;
+#endif 
 	} __randomize_layout;
 
 	/*

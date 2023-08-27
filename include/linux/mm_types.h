@@ -812,7 +812,7 @@ struct mm_struct {
 #endif /* CONFIG_LRU_GEN */
 #ifdef CONFIG_MTAT
 		struct bucket_sort	*bucket_sort;
-		struct mutex        bucket_lock;
+		struct spinlock     bucket_lock;
 #endif 
 	} __randomize_layout;
 

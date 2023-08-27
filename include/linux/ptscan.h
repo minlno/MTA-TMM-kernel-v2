@@ -9,6 +9,7 @@
 #define _PTSCAN_H_
 
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/list.h>
 #include <linux/rhashtable.h>
 
@@ -34,6 +35,7 @@ struct access_counter {
 	unsigned long pfn; // key
 	unsigned long count; // value
 	int bucket_idx;
+	struct mm_struct *target_mm;
 	struct rhash_head node;
 	struct list_head list;
 };
@@ -42,6 +44,7 @@ struct bucket_sort {
 	struct list_head buckets[NR_BUCKETS];
 };
 void bucket_init(struct bucket_sort *bucket_sort);
+void bucket_remove_page(struct page *page);
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter);

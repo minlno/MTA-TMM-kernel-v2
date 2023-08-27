@@ -1315,7 +1315,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 
 #ifdef CONFIG_MTAT
 	mm->bucket_sort = NULL;
-	mutex_init(&mm->bucket_lock);
+	spin_lock_init(&mm->bucket_lock);
 #endif
 	return mm;
 

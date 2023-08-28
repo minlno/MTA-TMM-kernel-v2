@@ -160,6 +160,7 @@ static struct access_counter *new_access_counter(unsigned long pfn, struct mm_st
 	counter->pfn = pfn;
 	counter->count = 1;
 	counter->bucket_idx = 0;
+	counter->cool_clock = mm->bucket_sort->cool_clock;
 	INIT_LIST_HEAD(&counter->list);
 	counter->target_mm = mm;
 	return counter;
@@ -213,6 +214,7 @@ void bucket_init(struct bucket_sort *bucket_sort)
 		bucket_sort->counts[i] = 0;
 		INIT_LIST_HEAD(&bucket_sort->buckets[i]);
 	}
+	bucket_sort->cool_clock = 0;
 }
 
 void bucket_remove_page(struct page *page)
@@ -342,9 +344,18 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 			bucket_insert_counter(bucket_sort, counter);
 			spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		} else {
+			spin_lock_irqsave(&mm->bucket_lock, flags);
+
+			if (counter->count >= cool_threshold)
+				mm->bucket_sort->cool_clock += 1;
+
+			if (counter->cool_clock != mm->bucket_sort->cool_clock) {
+				counter->count /= 2;
+				counter->cool_clock = mm->bucket_sort->cool_clock;
+			}
+
 			inc_access_counter(counter);
 
-			spin_lock_irqsave(&mm->bucket_lock, flags);
 			bucket_reinsert(bucket_sort, counter);
 			spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		}

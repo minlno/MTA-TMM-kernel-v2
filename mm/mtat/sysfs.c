@@ -15,8 +15,8 @@
  */
 // lock은 잡지 않음
 // 아래 변수를 수정할 때에는, 미리 kptscand, kmigrated를 멈춰야함.
-int hot_threshold = 0;
-int cool_threshold = 0;
+int hot_threshold = 8;
+int cool_threshold = 16;
 
 /*
  * setting directory

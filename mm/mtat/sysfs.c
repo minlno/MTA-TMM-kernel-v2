@@ -11,6 +11,98 @@
 #include "sysfs-common.h"
 
 /*
+ * global setting variables
+ */
+// lock은 잡지 않음
+// 아래 변수를 수정할 때에는, 미리 kptscand, kmigrated를 멈춰야함.
+int hot_threshold = 0;
+int cool_threshold = 0;
+
+/*
+ * setting directory
+ */
+
+struct mtat_sysfs_setting {
+	struct kobject kobj;
+};
+
+static struct mtat_sysfs_setting *mtat_sysfs_setting_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_setting), GFP_KERNEL);
+}
+
+static ssize_t hot_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%d\n", hot_threshold);
+}
+
+static ssize_t hot_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	int hot, err;
+	
+	err = kstrtoint(buf, 0, &hot);
+	if (err)
+		return err;
+	if (hot < 0)
+		return -EINVAL;
+
+	hot_threshold = hot;
+
+	return count;
+}
+
+static ssize_t cool_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sysfs_emit(buf, "%d\n", cool_threshold);
+}
+
+static ssize_t cool_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	int cool, err;
+	
+	err = kstrtoint(buf, 0, &cool);
+	if (err)
+		return err;
+	if (cool < 0)
+		return -EINVAL;
+
+	cool_threshold = cool;
+
+	return count;
+}
+
+static void mtat_sysfs_setting_release(struct kobject *kobj)
+{
+	struct mtat_sysfs_setting *setting = container_of(kobj,
+			struct mtat_sysfs_setting, kobj);
+
+	kfree(setting);
+}
+
+static struct kobj_attribute mtat_sysfs_setting_hot_attr =
+		__ATTR_RW_MODE(hot, 0600);
+
+static struct kobj_attribute mtat_sysfs_setting_cool_attr =
+		__ATTR_RW_MODE(cool, 0600);
+
+static struct attribute *mtat_sysfs_setting_attrs[] = {
+	&mtat_sysfs_setting_hot_attr.attr,
+	&mtat_sysfs_setting_cool_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_setting);
+
+static const struct kobj_type mtat_sysfs_setting_ktype = {
+	.release = mtat_sysfs_setting_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_setting_groups,
+};
+
+/*
  * kptscand directory
  */
 
@@ -87,7 +179,7 @@ static int mtat_sysfs_turn_ptscan_on(struct mtat_sysfs_kptscand *kptscand)
     //return PTR_ERR(ctx);
 	ctx = ptscan_new_ctx();
 	
-	// TODO: set target pid to ctx. if target pid == 0 then return err
+	// set target pid to ctx. if target pid == 0 then return err
 	ctx->pid = kptscand->target_pid;
 
 	err = ptscan_start(ctx);
@@ -360,6 +452,7 @@ static const struct kobj_type mtat_sysfs_kptscands_ktype = {
 struct mtat_sysfs_ui_dir {
 	struct kobject kobj;
 	struct mtat_sysfs_kptscands *kptscands;
+	struct mtat_sysfs_setting *setting;
 };
 
 static struct mtat_sysfs_ui_dir *mtat_sysfs_ui_dir_alloc(void)
@@ -370,6 +463,7 @@ static struct mtat_sysfs_ui_dir *mtat_sysfs_ui_dir_alloc(void)
 static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
 {
 	struct mtat_sysfs_kptscands *kptscands;
+	struct mtat_sysfs_setting *setting;
 	int err;
 
 	kptscands = mtat_sysfs_kptscands_alloc();
@@ -380,11 +474,31 @@ static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
 			&mtat_sysfs_kptscands_ktype, &ui_dir->kobj,
 			"kptscands");
 
-	if (err) {
-		kobject_put(&kptscands->kobj);
-		return err;
-	}
+	if (err)
+		goto put_kptscands;
 	ui_dir->kptscands = kptscands;
+
+	setting = mtat_sysfs_setting_alloc();
+	if (!setting) {
+		err = -ENOMEM;
+		goto put_kptscands;
+	}
+
+	err = kobject_init_and_add(&setting->kobj,
+			&mtat_sysfs_setting_ktype, &ui_dir->kobj,
+			"setting");
+
+	if (err)
+		goto put_setting;
+	ui_dir->setting = setting;
+	
+	return err;
+
+put_setting:
+	kobject_put(&setting->kobj);
+put_kptscands:
+	kobject_put(&kptscands->kobj);
+out:
 	return err;
 }
 

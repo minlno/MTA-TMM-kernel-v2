@@ -13,6 +13,12 @@
 #include <linux/list.h>
 #include <linux/rhashtable.h>
 
+/*
+ * global setting variables
+ */
+extern int hot_threshold;
+extern int cool_threshold;
+
 struct access_counter;
 struct bucket_sort;
 

@@ -38,6 +38,8 @@ struct rhashtable_params params = {
 
 static int nr_running_ctxs = 0;
 // nr_running_ctxs, count_table 보호용 락.
+// page free할 때는 절대 이 락을 잡으면 안됨. 잡으면 데드락 발생.
+// mm의 bucket_lock도 마찬가지.
 DEFINE_SPINLOCK(ptscan_lock);
 
 struct ptscan_ctx *ptscan_new_ctx(void)

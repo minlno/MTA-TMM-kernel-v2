@@ -19,7 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
-#include <linux/ptscan.h>
+#include <linux/mtat.h>
 
 #include <asm/mmu.h>
 

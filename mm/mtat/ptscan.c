@@ -8,7 +8,6 @@
 #define pr_fmt(fmt) "ptscan: " fmt
 
 #include <linux/slab.h>
-#include <linux/kthread.h>
 #include <linux/delay.h>
 #include <linux/pid.h>
 #include <linux/cgroup.h>
@@ -22,7 +21,8 @@
 #include <linux/jiffies.h>
 #include <linux/pagewalk.h>
 #include <linux/mmu_notifier.h>
-#include <linux/ptscan.h>
+#include <linux/kthread.h>
+#include <linux/mtat.h>
 
 #include "../internal.h"
 
@@ -429,15 +429,16 @@ static int kptscand_fn(void *data)
 	
 	while (!kthread_should_stop()) {
 		pr_info("kptscand is running\n");
-
-		ssleep(5);
-
 		pr_info("target_pid: %d\n", ctx->pid);
 
-		if (ctx->pid <= 0)
+		if (ctx->pid <= 0) {
+			ssleep(5);
 			continue;
+		}
 
 		mm_ptscan(ctx->target_mm);
+
+		ssleep(5);
 	}
 
 	// bucket_sort 메모리 해제 및 mm_struct의 bucket_sort를 NULL로 교체.
@@ -466,7 +467,7 @@ static int kptscand_fn(void *data)
 		kfree(tmp_count_table);
 	}
 
-	pr_info("kptscand has stopped\n");
+	pr_info("kptscand is stopped\n");
 	return 0;
 }
 /*

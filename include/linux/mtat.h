@@ -5,8 +5,8 @@
  * Author: MinHo Kim <mhkim@dgist.ac.kr>
  */
 
-#ifndef _PTSCAN_H_
-#define _PTSCAN_H_
+#ifndef _MTAT_H_
+#define _MTAT_H_
 
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -19,6 +19,9 @@
 extern int hot_threshold;
 extern int cool_threshold;
 
+/*
+ * PTSCAN
+ */
 struct access_counter;
 struct bucket_sort;
 
@@ -57,4 +60,27 @@ void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counte
 void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter);
 
-#endif /* _PTSCAN_H_ */
+/*
+ * MIGRATE
+ */
+
+#define MAX_NUM_LC 4
+#define MAX_NUM_BE 4
+struct migrate_ctx {
+	struct task_struct *kmigrated;
+	struct mutex kmigrated_lock;
+	// 최대 4개의 pid씩 존재 가능
+	// 초기값은 -1이고 앞에서부터 값이 대입됨. (lc[0] = pid, lc[1] = -1, ...)
+	int *lc_pids;
+	int *be_pids;
+};
+
+struct migrate_ctx *migrate_new_ctx(void);
+void migrate_destroy_ctx(struct migrate_ctx *ctx);
+
+int migrate_start(struct migrate_ctx *ctx);
+int migrate_stop(struct migrate_ctx *ctx);
+
+
+
+#endif /* _MTAT_H_ */

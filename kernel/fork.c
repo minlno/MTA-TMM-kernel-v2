@@ -99,7 +99,7 @@
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
 #include <linux/iommu.h>
-#include <linux/ptscan.h>
+#include <linux/mtat.h>
 
 #include <asm/pgalloc.h>
 #include <linux/uaccess.h>

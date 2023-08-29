@@ -6,7 +6,8 @@
  */
 
 #include <linux/slab.h>
-#include <linux/ptscan.h>
+#include <linux/kernel.h>
+#include <linux/mtat.h>
 
 #include "sysfs-common.h"
 
@@ -103,6 +104,354 @@ static const struct kobj_type mtat_sysfs_setting_ktype = {
 };
 
 /*
+ * pid directory (for kmigrated)
+ */
+
+struct mtat_sysfs_kmigrated_pid {
+	struct kobject kobj;
+	int pid;
+	int is_lc;
+};
+
+static struct mtat_sysfs_kmigrated_pid *mtat_sysfs_kmigrated_pid_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_kmigrated_pid), GFP_KERNEL);
+}
+
+static ssize_t migrate_pid_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid = container_of(kobj,
+			struct mtat_sysfs_kmigrated_pid, kobj);
+
+	return sysfs_emit(buf, "%d\n", kmigrated_pid->pid);
+}
+
+static ssize_t migrate_pid_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid;
+	int pid, err;
+
+	err = kstrtoint(buf, 0, &pid);
+	if (err)
+		return err;
+	if (pid < 0)
+		return -EINVAL;
+
+	kmigrated_pid = container_of(kobj, struct mtat_sysfs_kmigrated_pid, kobj);
+	kmigrated_pid->pid = pid;
+
+	return count;
+}
+
+static ssize_t lc_mode_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid = container_of(kobj,
+			struct mtat_sysfs_kmigrated_pid, kobj);
+
+	return sysfs_emit(buf, "%d\n", kmigrated_pid->is_lc);
+
+}
+
+static ssize_t lc_mode_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid;
+	int lc_mode, err;
+
+	err = kstrtoint(buf, 0, &lc_mode);
+	if (err)
+		return err;
+	if (lc_mode != 0 && lc_mode != 1)
+		return -EINVAL;
+
+	kmigrated_pid = container_of(kobj, struct mtat_sysfs_kmigrated_pid, kobj);
+	kmigrated_pid->is_lc = lc_mode;
+
+	return count;
+
+}
+
+static void mtat_sysfs_kmigrated_pid_release(struct kobject *kobj)
+{
+	kfree(container_of(kobj, struct mtat_sysfs_kmigrated_pid, kobj));
+}
+
+static struct kobj_attribute mtat_sysfs_kmigrated_pid_migrate_pid_attr =
+		__ATTR_RW_MODE(migrate_pid, 0600);
+
+static struct kobj_attribute mtat_sysfs_kmigrated_pid_lc_mode_attr =
+		__ATTR_RW_MODE(lc_mode, 0600);
+
+static struct attribute *mtat_sysfs_kmigrated_pid_attrs[] = {
+	&mtat_sysfs_kmigrated_pid_migrate_pid_attr.attr,
+	&mtat_sysfs_kmigrated_pid_lc_mode_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_kmigrated_pid);
+
+static const struct kobj_type mtat_sysfs_kmigrated_pid_ktype = {
+	.release = mtat_sysfs_kmigrated_pid_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_kmigrated_pid_groups,
+};
+
+
+/*
+ * enum mtat_sysfs_cmd - Commands for a specific kptscand/kmigrated.
+ */
+enum mtat_sysfs_cmd {
+	/* @MTAT_SYSFS_CMD_ON: Turn the kptscand/kmigrated on. */
+	MTAT_SYSFS_CMD_ON,
+	/* @MTAT_SYSFS_CMD_OFF: Turn the kptscand/kmigrated off. */
+	MTAT_SYSFS_CMD_OFF,
+	/* @NR_MTAT_SYSFS_CMDS: Total number of MTAT sysfs commands. */
+	NR_MTAT_SYSFS_CMDS,
+};
+
+/* Should match with enum mtat_sysfs_cmd */
+static const char * const mtat_sysfs_cmd_strs[] = {
+	"on",
+	"off",
+};
+
+/*
+ * kmigrated directory
+ */
+
+struct mtat_sysfs_kmigrated {
+	struct kobject kobj;
+	struct migrate_ctx *migrate_ctx;
+	struct mtat_sysfs_kmigrated_pid **pids;
+	int nr;
+};
+
+static struct mtat_sysfs_kmigrated *mtat_sysfs_kmigrated_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_kmigrated), GFP_KERNEL);
+}
+
+static void mtat_sysfs_kmigrated_rm_dirs(struct mtat_sysfs_kmigrated *kmigrated)
+{
+	struct mtat_sysfs_kmigrated_pid **pids = kmigrated->pids;
+	int i;
+	for (i = 0; i < kmigrated->nr; i++) {
+		kobject_put(&pids[i]->kobj);
+	}
+	kmigrated->nr = 0;
+	kfree(pids);
+	kmigrated->pids = NULL;
+}
+
+static int mtat_sysfs_kmigrated_add_dirs(struct mtat_sysfs_kmigrated *kmigrated,
+		int nr_pids)
+{
+	struct mtat_sysfs_kmigrated_pid **pids, *kmigrated_pid;
+	int err, i;
+
+	mtat_sysfs_kmigrated_rm_dirs(kmigrated);
+	if (!nr_pids)
+		return 0;
+
+	pids = kmalloc_array(nr_pids, sizeof(*pids), GFP_KERNEL | __GFP_NOWARN);
+	if (!pids)
+		return -ENOMEM;
+	kmigrated->pids = pids;
+
+	for (i = 0; i < nr_pids; i++) {
+		kmigrated_pid = mtat_sysfs_kmigrated_pid_alloc();
+		if (!kmigrated_pid) {
+			mtat_sysfs_kmigrated_rm_dirs(kmigrated);
+			return -ENOMEM;
+		}
+		
+		err = kobject_init_and_add(&kmigrated_pid->kobj,
+				&mtat_sysfs_kmigrated_pid_ktype, &kmigrated->kobj,
+				"%d", i);
+		if (err)
+			goto out;
+
+		pids[i] = kmigrated_pid;
+		kmigrated->nr++;
+	}
+	return 0;
+
+out:
+	mtat_sysfs_kmigrated_rm_dirs(kmigrated);
+	kobject_put(&kmigrated_pid->kobj);
+	return err;
+}
+
+static bool mtat_sysfs_migrate_ctx_running(struct migrate_ctx *ctx)
+{
+	bool running;
+
+	mutex_lock(&ctx->kmigrated_lock);
+	running = ctx->kmigrated != NULL;
+	mutex_unlock(&ctx->kmigrated_lock);
+	return running;
+}
+
+static inline bool mtat_sysfs_kmigrated_running(struct mtat_sysfs_kmigrated *kmigrated)
+{
+	return kmigrated->migrate_ctx &&
+		mtat_sysfs_migrate_ctx_running(kmigrated->migrate_ctx);
+}
+
+static int mtat_sysfs_turn_migrate_on(struct mtat_sysfs_kmigrated *kmigrated)
+{
+	struct migrate_ctx *ctx;
+	struct mtat_sysfs_kmigrated_pid **pids = kmigrated->pids;
+	int err, i, lc_idx, be_idx;
+
+	if (mtat_sysfs_kmigrated_running(kmigrated))
+		return -EBUSY;
+
+	if (kmigrated->migrate_ctx)
+		migrate_destroy_ctx(kmigrated->migrate_ctx);
+	kmigrated->migrate_ctx = NULL;
+
+	ctx = migrate_new_ctx();
+
+	lc_idx = 0;
+	be_idx = 0;
+	for (i = 0; i < kmigrated->nr; i++) {
+		if (pids[i]->is_lc) {
+			BUG_ON(lc_idx >= MAX_NUM_LC);
+			ctx->lc_pids[lc_idx] = pids[i]->pid;
+			lc_idx++;
+		} else {
+			BUG_ON(be_idx >= MAX_NUM_LC);
+			ctx->be_pids[be_idx] = pids[i]->pid;
+			be_idx++;
+		}
+	}
+
+	err = migrate_start(ctx);
+	if (err) {
+		migrate_destroy_ctx(ctx);
+		return err;
+	}
+	kmigrated->migrate_ctx = ctx;
+	return err;
+}
+
+static int mtat_sysfs_turn_migrate_off(struct mtat_sysfs_kmigrated *kmigrated)
+{
+	if (!kmigrated->migrate_ctx)
+		return -EINVAL;
+	return migrate_stop(kmigrated->migrate_ctx);
+}
+
+static int mtat_sysfs_kmigrated_handle_cmd(enum mtat_sysfs_cmd cmd,
+		struct mtat_sysfs_kmigrated *kmigrated)
+{
+	switch (cmd) {
+	case MTAT_SYSFS_CMD_ON:
+		return mtat_sysfs_turn_migrate_on(kmigrated);
+	case MTAT_SYSFS_CMD_OFF:
+		return mtat_sysfs_turn_migrate_off(kmigrated);
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static ssize_t migrate_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_kmigrated *kmigrated = container_of(kobj,
+			struct mtat_sysfs_kmigrated, kobj);
+	bool running = mtat_sysfs_kmigrated_running(kmigrated);
+
+	return sysfs_emit(buf, "%s\n", running ?
+			mtat_sysfs_cmd_strs[MTAT_SYSFS_CMD_ON] :
+			mtat_sysfs_cmd_strs[MTAT_SYSFS_CMD_OFF]);
+}
+
+static ssize_t migrate_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_kmigrated *kmigrated = container_of(kobj,
+			struct mtat_sysfs_kmigrated, kobj);
+	enum mtat_sysfs_cmd cmd;
+	ssize_t ret = -EINVAL;
+
+	if (!mutex_trylock(&mtat_sysfs_lock))
+		return -EBUSY;
+	for (cmd = 0; cmd < NR_MTAT_SYSFS_CMDS; cmd++) {
+		if (sysfs_streq(buf, mtat_sysfs_cmd_strs[cmd])) {
+			ret = mtat_sysfs_kmigrated_handle_cmd(cmd, kmigrated);
+			break;
+		}
+	}
+	mutex_unlock(&mtat_sysfs_lock);
+	if (!ret)
+		ret = count;
+	return ret;
+}
+
+static ssize_t nr_pids_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_kmigrated *kmigrated = container_of(kobj,
+			struct mtat_sysfs_kmigrated, kobj);
+
+	return sysfs_emit(buf, "%d\n", kmigrated->nr);
+}
+
+static ssize_t nr_pids_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_kmigrated *kmigrated;
+	int nr, err;
+
+	err = kstrtoint(buf, 0, &nr);
+	if (err)
+		return err;
+	if (nr < 0 || nr > 8)
+		return -EINVAL;
+
+	kmigrated = container_of(kobj, struct mtat_sysfs_kmigrated, kobj);
+
+	if (!mutex_trylock(&mtat_sysfs_lock))
+		return -EBUSY;
+	err = mtat_sysfs_kmigrated_add_dirs(kmigrated, nr);
+	mutex_unlock(&mtat_sysfs_lock);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static void mtat_sysfs_kmigrated_release(struct kobject *kobj)
+{
+	kfree(container_of(kobj, struct mtat_sysfs_kmigrated, kobj));
+}
+
+static struct kobj_attribute mtat_sysfs_kmigrated_migrate_attr =
+		__ATTR_RW_MODE(migrate, 0600);
+
+static struct kobj_attribute mtat_sysfs_kmigrated_nr_pids_attr =
+		__ATTR_RW_MODE(nr_pids, 0600);
+
+static struct attribute *mtat_sysfs_kmigrated_attrs[] = {
+	&mtat_sysfs_kmigrated_migrate_attr.attr,
+	&mtat_sysfs_kmigrated_nr_pids_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_kmigrated);
+
+static const struct kobj_type mtat_sysfs_kmigrated_ktype = {
+	.release = mtat_sysfs_kmigrated_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_kmigrated_groups,
+};
+
+/*
  * kptscand directory
  */
 
@@ -143,24 +492,6 @@ static inline bool mtat_sysfs_kptscand_running(
 	return kptscand->ptscan_ctx &&
 		mtat_sysfs_ptscan_ctx_running(kptscand->ptscan_ctx);
 }
-
-/*
- * enum mtat_sysfs_cmd - Commands for a specific kptscand.
- */
-enum mtat_sysfs_cmd {
-	/* @MTAT_SYSFS_CMD_ON: Turn the kptscand on. */
-	MTAT_SYSFS_CMD_ON,
-	/* @MTAT_SYSFS_CMD_OFF: Turn the kptscand off. */
-	MTAT_SYSFS_CMD_OFF,
-	/* @NR_MTAT_SYSFS_CMDS: Total number of MTAT sysfs commands. */
-	NR_MTAT_SYSFS_CMDS,
-};
-
-/* Should match with enum mtat_sysfs_cmd */
-static const char * const mtat_sysfs_cmd_strs[] = {
-	"on",
-	"off",
-};
 
 static int mtat_sysfs_turn_ptscan_on(struct mtat_sysfs_kptscand *kptscand)
 {
@@ -452,6 +783,7 @@ static const struct kobj_type mtat_sysfs_kptscands_ktype = {
 struct mtat_sysfs_ui_dir {
 	struct kobject kobj;
 	struct mtat_sysfs_kptscands *kptscands;
+	struct mtat_sysfs_kmigrated *kmigrated;
 	struct mtat_sysfs_setting *setting;
 };
 
@@ -463,39 +795,51 @@ static struct mtat_sysfs_ui_dir *mtat_sysfs_ui_dir_alloc(void)
 static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
 {
 	struct mtat_sysfs_kptscands *kptscands;
+	struct mtat_sysfs_kmigrated *kmigrated;
 	struct mtat_sysfs_setting *setting;
 	int err;
 
 	kptscands = mtat_sysfs_kptscands_alloc();
 	if (!kptscands)
 		return -ENOMEM;
-
 	err = kobject_init_and_add(&kptscands->kobj,
 			&mtat_sysfs_kptscands_ktype, &ui_dir->kobj,
 			"kptscands");
-
 	if (err)
 		goto put_kptscands;
-	ui_dir->kptscands = kptscands;
+
+	kmigrated = mtat_sysfs_kmigrated_alloc();
+	if (!kmigrated) {
+		err = -ENOMEM;
+		goto put_kptscands;
+	}
+	err = kobject_init_and_add(&kmigrated->kobj,
+			&mtat_sysfs_kmigrated_ktype, &ui_dir->kobj,
+			"kmigrated");
+	if (err)
+		goto put_kmigrated;
 
 	setting = mtat_sysfs_setting_alloc();
 	if (!setting) {
 		err = -ENOMEM;
-		goto put_kptscands;
+		goto put_kmigrated;
 	}
-
 	err = kobject_init_and_add(&setting->kobj,
 			&mtat_sysfs_setting_ktype, &ui_dir->kobj,
 			"setting");
-
 	if (err)
 		goto put_setting;
+
+	ui_dir->kptscands = kptscands;
+	ui_dir->kmigrated = kmigrated;
 	ui_dir->setting = setting;
 	
 	return err;
 
 put_setting:
 	kobject_put(&setting->kobj);
+put_kmigrated:
+	kobject_put(&kmigrated->kobj);
 put_kptscands:
 	kobject_put(&kptscands->kobj);
 out:

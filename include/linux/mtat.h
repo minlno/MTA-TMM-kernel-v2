@@ -52,9 +52,8 @@ struct access_counter {
 struct bucket_sort {
 	unsigned long counts[NR_BUCKETS];
 	struct list_head buckets[NR_BUCKETS];
-	int cool_clock;
 };
-void bucket_init(struct bucket_sort *bucket_sort);
+void bucket_init_array(struct bucket_sort **bucket_sort_arr);
 void bucket_remove_page(struct page *page);
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);

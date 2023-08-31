@@ -1314,8 +1314,9 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	lru_gen_init_mm(mm);
 
 #ifdef CONFIG_MTAT
-	mm->bucket_sort = NULL;
+	mm->bucket_sort_arr = NULL;
 	spin_lock_init(&mm->bucket_lock);
+	mm->cool_clock = 0;
 #endif
 	return mm;
 

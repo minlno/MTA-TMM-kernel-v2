@@ -62,7 +62,7 @@ void ptscan_destroy_ctx(struct ptscan_ctx *ctx)
 
 static int kptscand_fn(void *data);
 static struct mm_struct *ptscan_get_mm(int target_pid);
-static struct bucket_sort *alloc_bucket_sort(void);
+static struct bucket_sort **alloc_bucket_sort_array(void);
 
 int ptscan_start(struct ptscan_ctx *ctx)
 {
@@ -97,7 +97,7 @@ int ptscan_start(struct ptscan_ctx *ctx)
 	spin_lock_irqsave(&mm->bucket_lock, flags);
 
 	// 이 때, target_mm의 bucket_sort는 무조건 NULL이어야 함.
-	if (mm->bucket_sort) {
+	if (mm->bucket_sort_arr) {
 		spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		mutex_unlock(&ctx->kptscand_lock);
 		pr_err("bucket sort already exists!");
@@ -105,14 +105,14 @@ int ptscan_start(struct ptscan_ctx *ctx)
 	}
 	
 	// 할당 및 초기화 진행
-	mm->bucket_sort = alloc_bucket_sort();
-	if (!mm->bucket_sort) {
+	mm->bucket_sort_arr = alloc_bucket_sort_array();
+	if (!mm->bucket_sort_arr) {
 		spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		mutex_unlock(&ctx->kptscand_lock);
 		pr_err("Failed to allocate bucket_sort");
 		return -ENOMEM;
 	}
-	bucket_init(mm->bucket_sort);
+	bucket_init_array(mm->bucket_sort_arr);
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 
 	// kptscand 시작.
@@ -160,7 +160,7 @@ static struct access_counter *new_access_counter(unsigned long pfn, struct mm_st
 	counter->pfn = pfn;
 	counter->count = 1;
 	counter->bucket_idx = 0;
-	counter->cool_clock = mm->bucket_sort->cool_clock;
+	counter->cool_clock = mm->cool_clock;
 	INIT_LIST_HEAD(&counter->list);
 	counter->target_mm = mm;
 	return counter;
@@ -214,12 +214,35 @@ void bucket_init(struct bucket_sort *bucket_sort)
 		bucket_sort->counts[i] = 0;
 		INIT_LIST_HEAD(&bucket_sort->buckets[i]);
 	}
-	bucket_sort->cool_clock = 0;
+}
+
+static struct bucket_sort **alloc_bucket_sort_array(void)
+{
+	struct bucket_sort **bucket_sort_arr = NULL;
+	bucket_sort_arr = kmalloc(sizeof(*bucket_sort_arr) * 2, GFP_KERNEL);
+
+	bucket_sort_arr[0] = alloc_bucket_sort(); // fast memory
+	bucket_sort_arr[1] = alloc_bucket_sort(); // slow memory
+
+	return bucket_sort_arr;
+}
+
+static void destroy_bucket_sort_array(struct bucket_sort **bucket_sort_arr)
+{
+	destroy_bucket_sort(bucket_sort_arr[0]);
+	destroy_bucket_sort(bucket_sort_arr[1]);
+}
+
+void bucket_init_array(struct bucket_sort **bucket_sort_arr)
+{
+	bucket_init(bucket_sort_arr[0]);
+	bucket_init(bucket_sort_arr[1]);
 }
 
 void bucket_remove_page(struct page *page)
 {
 	unsigned long pfn = page_to_pfn(page);
+	int nid = page_to_nid(page);
 	struct access_counter *counter;
 	struct mm_struct *mm;
 	unsigned long flags;
@@ -243,11 +266,16 @@ void bucket_remove_page(struct page *page)
 	}
 
 	spin_lock_irqsave(&mm->bucket_lock, flags);
-	if (!mm->bucket_sort) {
+	if (!mm->bucket_sort_arr) {
 		spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		return;
 	}
-	bucket_remove_counter(mm->bucket_sort, counter);
+	// TODO: page 구조체로 node id 알아내기
+	if (nid > 1) {
+		pr_err("nid(%d) > 1 !!", nid);
+		nid = 1;
+	}
+	bucket_remove_counter(mm->bucket_sort_arr[nid], counter);
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 
 	kfree(counter);
@@ -301,16 +329,13 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 					struct mm_walk *walk)
 {
 	unsigned long pfn;
+	int nid;
 	struct access_counter *counter = NULL;
 	struct mm_struct *mm = walk->mm;
-	struct bucket_sort *bucket_sort = mm->bucket_sort;
+	// TODO pfn으로 node id 알아내기.
+	struct bucket_sort *bucket_sort = NULL;
 	unsigned long flags;
 	int err;
-
-	if (!bucket_sort) {
-		pr_err("There is no bucket_sort!!!");
-		return 0;
-	}
 
 	if (!pte) {
 		pr_err("PTE pointer is NULL!!!!!");
@@ -322,6 +347,17 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 
 	if (ptep_clear_flush_young_notify(walk->vma, addr, pte)) {
 		pfn = pte_pfn(*pte);
+		nid = page_to_nid(pfn_to_page(pfn));
+		if (nid > 1) {
+			pr_err("nid(%d) > 2 !!", nid);
+			nid = 1;
+		}
+		bucket_sort = mm->bucket_sort_arr[nid];
+		if (!bucket_sort) {
+			pr_err("There is no bucket_sort!!!");
+			return 0;
+		}
+
 		spin_lock_irqsave(&ptscan_lock, flags);
 		counter = rhashtable_lookup_fast(count_table, &pfn, params);
 		spin_unlock_irqrestore(&ptscan_lock, flags);
@@ -347,11 +383,11 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 			spin_lock_irqsave(&mm->bucket_lock, flags);
 
 			if (counter->count >= cool_threshold)
-				mm->bucket_sort->cool_clock += 1;
+				mm->cool_clock += 1;
 
-			if (counter->cool_clock != mm->bucket_sort->cool_clock) {
+			if (counter->cool_clock != mm->cool_clock) {
 				counter->count /= 2;
-				counter->cool_clock = mm->bucket_sort->cool_clock;
+				counter->cool_clock = mm->cool_clock;
 			}
 
 			inc_access_counter(counter);
@@ -388,8 +424,11 @@ static void mm_ptscan(struct mm_struct *mm)
 	pr_info("-- elapsed time (s): %lu/%u", elapsed, HZ);
 
 	spin_lock_irqsave(&mm->bucket_lock, flags);
-	for (int i = 0; i < NR_BUCKETS; i++) {
-		pr_info("-- bucket[%d] count: %lu", i, mm->bucket_sort->counts[i]);
+	for (int nid = 0; nid < 2; nid++) {
+		pr_info("NODE %d:\n", nid);
+		for (int i = 0; i < NR_BUCKETS; i++) {
+			pr_info("-- bucket[%d] count: %lu\n", i, mm->bucket_sort_arr[nid]->counts[i]);
+		}
 	}
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 }
@@ -424,7 +463,7 @@ static int kptscand_fn(void *data)
 {
 	struct ptscan_ctx *ctx = data;
 	unsigned long flags;
-	struct bucket_sort *tmp_bucket_sort;
+	struct bucket_sort **tmp_bucket_sort_arr;
 	struct rhashtable *tmp_count_table;
 	
 	while (!kthread_should_stop()) {
@@ -443,11 +482,11 @@ static int kptscand_fn(void *data)
 
 	// bucket_sort 메모리 해제 및 mm_struct의 bucket_sort를 NULL로 교체.
 	spin_lock_irqsave(&ctx->target_mm->bucket_lock, flags);
-	tmp_bucket_sort = ctx->target_mm->bucket_sort;
-	ctx->target_mm->bucket_sort = NULL;
+	tmp_bucket_sort_arr = ctx->target_mm->bucket_sort_arr;
+	ctx->target_mm->bucket_sort_arr = NULL;
 	spin_unlock_irqrestore(&ctx->target_mm->bucket_lock, flags);
 
-	destroy_bucket_sort(tmp_bucket_sort);
+	destroy_bucket_sort_array(tmp_bucket_sort_arr);
 
 	mutex_lock(&ctx->kptscand_lock);
 	ctx->kptscand = NULL;

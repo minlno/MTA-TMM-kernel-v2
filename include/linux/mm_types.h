@@ -811,8 +811,9 @@ struct mm_struct {
 		} lru_gen;
 #endif /* CONFIG_LRU_GEN */
 #ifdef CONFIG_MTAT
-		struct bucket_sort	*bucket_sort;
+		struct bucket_sort	**bucket_sort_arr;
 		struct spinlock     bucket_lock;
+		int cool_clock;
 #endif 
 	} __randomize_layout;
 

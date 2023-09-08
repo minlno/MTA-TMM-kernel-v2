@@ -111,6 +111,7 @@ struct mtat_sysfs_kmigrated_pid {
 	struct kobject kobj;
 	int pid;
 	int is_lc;
+	unsigned long wss; // warm set size (Bytes)
 };
 
 static struct mtat_sysfs_kmigrated_pid *mtat_sysfs_kmigrated_pid_alloc(void)
@@ -152,7 +153,6 @@ static ssize_t lc_mode_show(struct kobject *kobj,
 			struct mtat_sysfs_kmigrated_pid, kobj);
 
 	return sysfs_emit(buf, "%d\n", kmigrated_pid->is_lc);
-
 }
 
 static ssize_t lc_mode_store(struct kobject *kobj,
@@ -171,7 +171,32 @@ static ssize_t lc_mode_store(struct kobject *kobj,
 	kmigrated_pid->is_lc = lc_mode;
 
 	return count;
+}
 
+static ssize_t warm_size_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid = container_of(kobj,
+			struct mtat_sysfs_kmigrated_pid, kobj);
+
+	return sysfs_emit(buf, "%lu\n", kmigrated_pid->wss);
+}
+
+static ssize_t warm_size_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_kmigrated_pid *kmigrated_pid;
+	char *end;
+	unsigned long wss;
+
+	wss = memparse(buf, &end);
+	if (*end != '\0')
+		return -EINVAL;
+
+	kmigrated_pid = container_of(kobj, struct mtat_sysfs_kmigrated_pid, kobj);
+	kmigrated_pid->wss = wss;
+
+	return count;
 }
 
 static void mtat_sysfs_kmigrated_pid_release(struct kobject *kobj)

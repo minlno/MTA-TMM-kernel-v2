@@ -22,6 +22,7 @@
 #include <linux/pagewalk.h>
 #include <linux/mmu_notifier.h>
 #include <linux/kthread.h>
+#include <linux/nodemask.h>
 #include <linux/mtat.h>
 
 #include "../internal.h"
@@ -34,6 +35,7 @@ struct rhashtable_params params = {
 	.key_offset = offsetof(struct access_counter, pfn),
 	.key_len = sizeof(unsigned long),
 	.automatic_shrinking = true,
+	.min_size = 0xffff,
 };
 
 static int nr_running_ctxs = 0;
@@ -61,7 +63,6 @@ void ptscan_destroy_ctx(struct ptscan_ctx *ctx)
 }
 
 static int kptscand_fn(void *data);
-static struct mm_struct *ptscan_get_mm(int target_pid);
 static struct bucket_sort **alloc_bucket_sort_array(void);
 
 int ptscan_start(struct ptscan_ctx *ctx)
@@ -72,7 +73,17 @@ int ptscan_start(struct ptscan_ctx *ctx)
 
 	spin_lock_irqsave(&ptscan_lock, flags);
 	if (!nr_running_ctxs) {
-		count_table = kmalloc(sizeof(*count_table), GFP_KERNEL);
+		if (node_state(1, N_MEMORY)) {
+			count_table = kmalloc_node(sizeof(*count_table), GFP_NOWAIT, 1);
+		} else { 
+			count_table = kmalloc(sizeof(*count_table), GFP_NOWAIT);
+		}
+		if (!count_table){
+			spin_unlock_irqrestore(&ptscan_lock, flags);
+			pr_err("Failed to allocate count_table\n");
+			return -ENOMEM;
+		}
+
 		err = rhashtable_init(count_table, &params);
 		if (err) {
 			spin_unlock_irqrestore(&ptscan_lock, flags);
@@ -154,7 +165,13 @@ int ptscan_stop(struct ptscan_ctx *ctx)
 static struct access_counter *new_access_counter(unsigned long pfn, struct mm_struct *mm)
 {
 	struct access_counter *counter = NULL;
-	counter = kmalloc(sizeof(*counter), GFP_KERNEL);
+	if (node_state(1, N_MEMORY)) {
+		//pr_err("allocate from PMEM\n");
+		counter = kmalloc_node(sizeof(*counter), GFP_NOWAIT, 1);
+	} else {
+		pr_err("allocate from DRAM\n");
+		counter = kmalloc(sizeof(*counter), GFP_NOWAIT);
+	}
 	if (!counter)
 		return NULL;
 	counter->pfn = pfn;
@@ -166,8 +183,9 @@ static struct access_counter *new_access_counter(unsigned long pfn, struct mm_st
 	return counter;
 }
 
-static void destroy_access_counter(struct access_counter *counter)
+void destroy_access_counter(struct access_counter *counter)
 {
+	rhashtable_remove_fast(count_table, &counter->node, params);
 	kfree(counter);
 }
 
@@ -197,7 +215,11 @@ static int get_bucket_index(unsigned long count)
 static struct bucket_sort *alloc_bucket_sort(void)
 {
 	struct bucket_sort *bucket_sort = NULL;
-	bucket_sort = kmalloc(sizeof(*bucket_sort), GFP_KERNEL);
+	if (node_state(1, N_MEMORY)) {
+		bucket_sort = kmalloc_node(sizeof(*bucket_sort), GFP_NOWAIT, 1);
+	} else {
+		bucket_sort = kmalloc(sizeof(*bucket_sort), GFP_NOWAIT);
+	}
 	
 	return bucket_sort;
 }
@@ -219,10 +241,25 @@ void bucket_init(struct bucket_sort *bucket_sort)
 static struct bucket_sort **alloc_bucket_sort_array(void)
 {
 	struct bucket_sort **bucket_sort_arr = NULL;
-	bucket_sort_arr = kmalloc(sizeof(*bucket_sort_arr) * 2, GFP_KERNEL);
+	if (node_state(1, N_MEMORY)) {
+		bucket_sort_arr = kmalloc_node(sizeof(*bucket_sort_arr) * 2, GFP_NOWAIT, 1);
+	} else {
+		bucket_sort_arr = kmalloc(sizeof(*bucket_sort_arr) * 2, GFP_NOWAIT);
+	}
 
-	bucket_sort_arr[0] = alloc_bucket_sort(); // fast memory
-	bucket_sort_arr[1] = alloc_bucket_sort(); // slow memory
+	if (bucket_sort_arr != NULL) {
+		bucket_sort_arr[0] = alloc_bucket_sort(); // fast memory
+		if (bucket_sort_arr[0] == NULL) {
+			kfree(bucket_sort_arr);
+			return NULL;
+		}
+		bucket_sort_arr[1] = alloc_bucket_sort(); // slow memory
+		if (bucket_sort_arr[1] == NULL) {
+			kfree(bucket_sort_arr[0]);
+			kfree(bucket_sort_arr);
+			return NULL;
+		}
+	}
 
 	return bucket_sort_arr;
 }
@@ -278,7 +315,7 @@ void bucket_remove_page(struct page *page)
 	bucket_remove_counter(mm->bucket_sort_arr[nid], counter);
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 
-	kfree(counter);
+	destroy_access_counter(counter);
 }
 
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter)
@@ -318,7 +355,7 @@ void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *cou
 static void rh_free_fn(void *ptr, void *arg)
 {
 	struct access_counter *counter = ptr;
-	destroy_access_counter(counter);
+	kfree(counter);
 }
 
 /*
@@ -352,36 +389,42 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 			pr_err("nid(%d) > 2 !!", nid);
 			nid = 1;
 		}
-		bucket_sort = mm->bucket_sort_arr[nid];
-		if (!bucket_sort) {
-			pr_err("There is no bucket_sort!!!");
+		if (!mm->bucket_sort_arr) {
+			pr_err("There is no bucket_sort_arr!!!");
 			return 0;
 		}
+		bucket_sort = mm->bucket_sort_arr[nid];
 
+		/*
 		spin_lock_irqsave(&ptscan_lock, flags);
+		if (!count_table) {
+			spin_unlock_irqrestore(&ptscan_lock, flags);
+			pr_err("count_table is NULL!!!\n");
+			return 0;
+		}
+		*/
+		spin_lock_irqsave(&mm->bucket_lock, flags);
 		counter = rhashtable_lookup_fast(count_table, &pfn, params);
-		spin_unlock_irqrestore(&ptscan_lock, flags);
+		//spin_unlock_irqrestore(&ptscan_lock, flags);
 		if (!counter) {
 			counter = new_access_counter(pfn, mm);
 			if (!counter) {
 				pr_err("Failed to allocate access_counter\n");
+				spin_unlock_irqrestore(&mm->bucket_lock, flags);
 				return 0;
 			}
-			spin_lock_irqsave(&ptscan_lock, flags);
+			//spin_lock_irqsave(&ptscan_lock, flags);
 			err = rhashtable_insert_fast(count_table, &counter->node, params);
-			spin_unlock_irqrestore(&ptscan_lock, flags);
+			//spin_unlock_irqrestore(&ptscan_lock, flags);
 			if (err) {
-				destroy_access_counter(counter);
+				spin_unlock_irqrestore(&mm->bucket_lock, flags);
+				kfree(counter);
 				pr_err("Failed to insert access_counter into count_table\n");
 				return 0;
 			}
 
-			spin_lock_irqsave(&mm->bucket_lock, flags);
 			bucket_insert_counter(bucket_sort, counter);
-			spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		} else {
-			spin_lock_irqsave(&mm->bucket_lock, flags);
-
 			if (counter->count >= cool_threshold)
 				mm->cool_clock += 1;
 
@@ -393,8 +436,8 @@ static int ptscan_pte_entry(pte_t *pte, unsigned long addr, unsigned long next,
 			inc_access_counter(counter);
 
 			bucket_reinsert(bucket_sort, counter);
-			spin_unlock_irqrestore(&mm->bucket_lock, flags);
 		}
+		spin_unlock_irqrestore(&mm->bucket_lock, flags);
 	}
 
 	return 0;
@@ -433,7 +476,7 @@ static void mm_ptscan(struct mm_struct *mm)
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 }
 
-static struct mm_struct *ptscan_get_mm(int target_pid)
+struct mm_struct *ptscan_get_mm(int target_pid)
 {
 	struct pid *pid = NULL;
 	struct task_struct *tsk = NULL;

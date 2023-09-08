@@ -38,6 +38,8 @@ void ptscan_destroy_ctx(struct ptscan_ctx *ctx);
 int ptscan_start(struct ptscan_ctx *ctx);
 int ptscan_stop(struct ptscan_ctx *ctx);
 
+struct mm_struct *ptscan_get_mm(int target_pid);
+
 #define NR_BUCKETS 20
 #define MAX_ACCESS_COUNTER_VALUE 20 // 이 값도 포함 MAX
 struct access_counter { 
@@ -53,6 +55,7 @@ struct bucket_sort {
 	unsigned long counts[NR_BUCKETS];
 	struct list_head buckets[NR_BUCKETS];
 };
+void destroy_access_counter(struct access_counter *counter);
 void bucket_init_array(struct bucket_sort **bucket_sort_arr);
 void bucket_remove_page(struct page *page);
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);

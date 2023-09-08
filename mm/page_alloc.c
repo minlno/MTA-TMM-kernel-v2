@@ -1008,10 +1008,6 @@ done_merging:
 	else
 		add_to_free_list(page, zone, order, migratetype);
 
-#ifdef CONFIG_MTAT
-	bucket_remove_page(page);
-#endif
-
 	/* Notify page reporting subsystem of freed page */
 	if (!(fpi_flags & FPI_SKIP_REPORT_NOTIFY))
 		page_reporting_notify_free(order);

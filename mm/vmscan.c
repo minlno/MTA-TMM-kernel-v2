@@ -7745,6 +7745,9 @@ void wakeup_kswapd(struct zone *zone, gfp_t gfp_flags, int order,
 	pg_data_t *pgdat;
 	enum zone_type curr_idx;
 
+	if (zone_to_nid(zone) == 0)
+		return;
+
 	if (!managed_zone(zone))
 		return;
 
@@ -7829,6 +7832,9 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 void kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+
+	if (nid == 0)
+		return;
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {

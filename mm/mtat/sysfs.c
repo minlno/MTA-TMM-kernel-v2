@@ -189,6 +189,7 @@ static ssize_t warm_size_store(struct kobject *kobj,
 	char *end;
 	unsigned long wss;
 
+	buf = strstrip(buf);
 	wss = memparse(buf, &end);
 	if (*end != '\0')
 		return -EINVAL;
@@ -210,9 +211,13 @@ static struct kobj_attribute mtat_sysfs_kmigrated_pid_migrate_pid_attr =
 static struct kobj_attribute mtat_sysfs_kmigrated_pid_lc_mode_attr =
 		__ATTR_RW_MODE(lc_mode, 0600);
 
+static struct kobj_attribute mtat_sysfs_kmigrated_pid_warm_size_attr =
+		__ATTR_RW_MODE(warm_size, 0600);
+
 static struct attribute *mtat_sysfs_kmigrated_pid_attrs[] = {
 	&mtat_sysfs_kmigrated_pid_migrate_pid_attr.attr,
 	&mtat_sysfs_kmigrated_pid_lc_mode_attr.attr,
+	&mtat_sysfs_kmigrated_pid_warm_size_attr.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(mtat_sysfs_kmigrated_pid);

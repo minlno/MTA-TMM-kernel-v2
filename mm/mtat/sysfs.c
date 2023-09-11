@@ -17,7 +17,7 @@
 // lock은 잡지 않음
 // 아래 변수를 수정할 때에는, 미리 kptscand, kmigrated를 멈춰야함.
 int hot_threshold = 8;
-int cool_threshold = 16;
+int cool_threshold = 18;
 
 /*
  * setting directory
@@ -351,6 +351,7 @@ static int mtat_sysfs_turn_migrate_on(struct mtat_sysfs_kmigrated *kmigrated)
 		if (pids[i]->is_lc) {
 			BUG_ON(lc_idx >= MAX_NUM_LC);
 			ctx->lc_pids[lc_idx] = pids[i]->pid;
+			ctx->lc_wss[lc_idx] = pids[i]->wss;
 			lc_idx++;
 		} else {
 			BUG_ON(be_idx >= MAX_NUM_LC);

@@ -42,19 +42,32 @@ struct migrate_ctx *migrate_new_ctx(void)
 
 	ctx->lc_pids = kmalloc(sizeof(int) * MAX_NUM_LC, GFP_KERNEL);
 	if (!ctx->lc_pids) {
+		pr_err("failed to allocate lc_pids\n");
 		kfree(ctx);
 		return NULL;
 	}
 
 	ctx->be_pids = kmalloc(sizeof(int) * MAX_NUM_BE, GFP_KERNEL);
 	if (!ctx->be_pids) {
+		pr_err("failed to allocate be_pids\n");
 		kfree(ctx->lc_pids);
 		kfree(ctx);
 		return NULL;
 	}
 
-	for (i = 0; i < MAX_NUM_LC; i++)
+	ctx->lc_wss = kmalloc(sizeof(unsigned long) * MAX_NUM_LC, GFP_KERNEL);
+	if (!ctx->lc_wss) {
+		pr_err("failed to allocate lc_wss\n");
+		kfree(ctx->lc_pids);
+		kfree(ctx->be_pids);
+		kfree(ctx);
+		return NULL;
+	}
+
+	for (i = 0; i < MAX_NUM_LC; i++) {
 		ctx->lc_pids[i] = -1;
+		ctx->lc_wss[i] = 0;
+	}
 	for (i = 0; i < MAX_NUM_BE; i++)
 		ctx->be_pids[i] = -1;
 
@@ -170,75 +183,124 @@ static void scan_bucket_sort_list(struct bucket_sort *bsort,
 //	   be의 DRAM bucket scan 수행
 //	  - hot set 상관없이 idx 낮은 순으로 migration 수행
 // migrate한 데이터 크기를 바이트 단위로 반환
-static unsigned int do_lc_migration(int lc_pid, int be_pid)
+static unsigned int do_lc_migration(int lc_pid, int be_pid, unsigned long wss)
 {
 	LIST_HEAD(promote_folios);
 	LIST_HEAD(demote_folios);
 	struct mm_struct *lc_mm, *be_mm;
-	//unsigned long flags;
 	int i;
-	unsigned int nr_promote, nr_demote;
+	unsigned int nr_promote, nr_demote, max_promote, max_demote;
 	struct bucket_sort *bsort;
-	unsigned long flags;
+	unsigned long phs, dhs, dcs, ds, hs;
 
 	pr_info("%s called\n", __func__);
 
 	lc_mm = ptscan_get_mm(lc_pid);
-	if (be_pid != -1)
-		be_mm = ptscan_get_mm(be_pid);
+	be_mm = ptscan_get_mm(be_pid);
 
-	nr_promote = 0;
-	nr_demote = 0;
-	/* 
-	 * irq enable하고 bucket_lock을 잡는건 위험함.
-	 * (page free할 때 bucket_lock을 잡기 때문임.)
-	 * 그러나 bucket_sort에 포함된 page가 인터럽트 컨텍스트에서
-	 * 해제될 가능성은 우리 실험환경에서는 존재하지 않으므로
-	 * folio_isolate_lru를 호출하기 위해 irq enable된 상태로
-	 * bucket_lock을 잡음.
-	 */
 	spin_lock(&lc_mm->bucket_lock);
 	if (!lc_mm->bucket_sort_arr) {
 		spin_unlock(&lc_mm->bucket_lock);
 		pr_err("%s: lc bucket_sort is NULL\n", __func__);
 		return 0;
 	}
-
-	// lc PMEM bucket scan
-	bsort = lc_mm->bucket_sort_arr[1];
-	for (i = NR_BUCKETS-1; i >= hot_threshold-1; i--) {
-		if (!bsort->counts[i])
-			continue;
-		scan_bucket_sort_list(bsort, &bsort->buckets[i],
-				&promote_folios, &nr_promote, 2621440); // max 2621440 pages -> 10G
-
-		if (nr_promote >= 2621440)
-			break;
-	}
-
-	// lc DRAM bucket scan
-	bsort = lc_mm->bucket_sort_arr[0];
-	for (i = 0; i < hot_threshold-1; i++) {
-		if (!bsort->counts[i])
-			continue;
-		scan_bucket_sort_list(bsort, &bsort->buckets[i],
-				&demote_folios, &nr_demote, nr_promote);
-
-		if (nr_demote >= nr_promote)
-			break;
-	}
+	phs = bucket_hot_size(lc_mm->bucket_sort_arr[1]);
+	dhs = bucket_hot_size(lc_mm->bucket_sort_arr[0]);
+	dcs = bucket_cold_size(lc_mm->bucket_sort_arr[0]);
 	spin_unlock(&lc_mm->bucket_lock);
 
-	if (be_pid == -1) 
-		goto do_migration;
-	
+	ds = dhs + dcs;
+	hs = phs + dhs;
+	wss /= PAGE_SIZE;
+
 	spin_lock(&be_mm->bucket_lock);
 	if (!be_mm->bucket_sort_arr) {
 		spin_unlock(&be_mm->bucket_lock);
 		pr_err("%s: be bucket_sort is NULL\n", __func__);
 		return 0;
 	}
-	// be DRAM bucket scan
+	spin_unlock(&be_mm->bucket_lock);
+
+	nr_promote = 0;
+	nr_demote = 0;
+	max_promote = 2621440; // 10G
+
+// hot promotion
+	spin_lock(&lc_mm->bucket_lock);
+	// lc PMEM bucket scan
+	bsort = lc_mm->bucket_sort_arr[1];
+	for (i = NR_BUCKETS-1; i >= hot_threshold-1; i--) {
+		if (!bsort->counts[i])
+			continue;
+		scan_bucket_sort_list(bsort, &bsort->buckets[i],
+				&promote_folios, &nr_promote, max_promote);
+
+		if (nr_promote >= max_promote)
+			break;
+	}
+	spin_unlock(&lc_mm->bucket_lock);
+
+	if (nr_promote >= max_promote)
+		goto warm_demotion;
+
+// warm promotion
+    if (dcs >= wss)
+		goto be_promotion;
+
+	max_promote = min(max_promote, (unsigned int) (nr_promote + wss - dcs));
+
+	spin_lock(&lc_mm->bucket_lock);
+	bsort = lc_mm->bucket_sort_arr[1];
+	for (i = hot_threshold-2; i >= 0; i--) {
+		if (!bsort->counts[i])
+			continue;
+		scan_bucket_sort_list(bsort, &bsort->buckets[i],
+				&promote_folios, &nr_promote, max_promote);
+		if (nr_promote >= max_promote)
+			break;
+	}
+	spin_unlock(&lc_mm->bucket_lock);
+
+be_promotion:
+	if (ds <= hs + wss)
+		goto warm_demotion;
+
+	max_promote = nr_promote + ds - hs - wss;
+
+	spin_lock(&be_mm->bucket_lock);
+	bsort = be_mm->bucket_sort_arr[1];
+	for (i = NR_BUCKETS-1; i >= 0; i--) {
+		if (!bsort->counts[i])
+			continue;
+		scan_bucket_sort_list(bsort, &bsort->buckets[i],
+				&promote_folios, &nr_promote, max_promote);
+
+		if (nr_promote >= max_promote)
+			break;
+	}
+	spin_unlock(&be_mm->bucket_lock);
+
+warm_demotion:
+	if (dcs <= wss)
+		goto be_demotion;
+
+	max_demote = min(nr_promote, (unsigned int)(dcs - wss));
+
+	spin_lock(&lc_mm->bucket_lock);
+	bsort = lc_mm->bucket_sort_arr[0];
+	for (i = 0; i < hot_threshold-1; i++) {
+		if (!bsort->counts[i])
+			continue;
+		scan_bucket_sort_list(bsort, &bsort->buckets[i],
+				&demote_folios, &nr_demote, max_demote);
+
+		if (nr_demote >= max_demote)
+			break;
+	}
+	spin_unlock(&lc_mm->bucket_lock);
+
+be_demotion:
+	spin_lock(&be_mm->bucket_lock);
 	bsort = be_mm->bucket_sort_arr[0];
 	for (i = 0; i < NR_BUCKETS; i++) {
 		if (!bsort->counts[i])
@@ -251,7 +313,7 @@ static unsigned int do_lc_migration(int lc_pid, int be_pid)
 	}
 	spin_unlock(&be_mm->bucket_lock);
 
-do_migration:
+//do_migration
 	nr_demote = migrate_folio_list(&demote_folios, 1);
 	nr_promote = migrate_folio_list(&promote_folios, 0);
 
@@ -291,9 +353,7 @@ static unsigned int do_be_migration(int be_pid)
 	}
 
 	bsort = mm->bucket_sort_arr[0];
-	for (i = 0; i < hot_threshold-1; i++) {
-		max_demote += bsort->counts[i];
-	}
+	max_demote = (unsigned int) bucket_cold_size(bsort);
 
 	// PMEM bucket scan
 	bsort = mm->bucket_sort_arr[1];
@@ -354,8 +414,8 @@ static void do_migration(struct migrate_ctx *ctx)
 	unsigned int lc_migrated_sz = 0;
 	unsigned int be_migrated_sz = 0;
 	
-	if (lc_pids[0] != -1) 
-		lc_migrated_sz = do_lc_migration(lc_pids[0], be_pids[0]);
+	if (lc_pids[0] != -1 && be_pids[0] != -1) 
+		lc_migrated_sz = do_lc_migration(lc_pids[0], be_pids[0], ctx->lc_wss[0]);
 	if (be_pids[0] != -1) 
 		be_migrated_sz = do_be_migration(be_pids[0]);
 

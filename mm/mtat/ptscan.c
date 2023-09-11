@@ -349,6 +349,28 @@ void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *cou
 	}
 }
 
+unsigned long bucket_hot_size(struct bucket_sort *bucket_sort)
+{
+	unsigned long count = 0;
+	int i;
+	for (i = hot_threshold-1; i < NR_BUCKETS; i++) {
+		count += bucket_sort->counts[i];
+	}
+
+	return count;
+}
+
+unsigned long bucket_cold_size(struct bucket_sort *bucket_sort)
+{
+	unsigned long count = 0;
+	int i;
+	for (i = 0; i < hot_threshold-1; i++) {
+		count += bucket_sort->counts[i];
+	}
+
+	return count;
+}
+
 /* 
  * count_table structure's methods
  */

@@ -61,6 +61,8 @@ void bucket_remove_page(struct page *page);
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
 void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter);
+unsigned long bucket_hot_size(struct bucket_sort *bucket_sort);
+unsigned long bucket_cold_size(struct bucket_sort *bucket_sort);
 
 /*
  * MIGRATE
@@ -75,6 +77,7 @@ struct migrate_ctx {
 	// 초기값은 -1이고 앞에서부터 값이 대입됨. (lc[0] = pid, lc[1] = -1, ...)
 	int *lc_pids;
 	int *be_pids;
+	unsigned long *lc_wss; // Byte 단위
 };
 
 struct migrate_ctx *migrate_new_ctx(void);

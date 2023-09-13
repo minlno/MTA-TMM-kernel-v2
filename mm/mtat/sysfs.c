@@ -11,6 +11,17 @@
 
 #include "sysfs-common.h"
 
+enum mtat_sysfs_cmd {
+	MTAT_SYSFS_CMD_ON,
+	MTAT_SYSFS_CMD_OFF,
+	NR_MTAT_SYSFS_CMDS,
+};
+
+const char * const mtat_sysfs_cmd_strs[] = {
+	"on",
+	"off",
+};
+
 /*
  * global setting variables
  */
@@ -101,6 +112,297 @@ static const struct kobj_type mtat_sysfs_setting_ktype = {
 	.release = mtat_sysfs_setting_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = mtat_sysfs_setting_groups,
+};
+
+/*
+ * pid directory (for pebs)
+ */
+
+struct mtat_sysfs_pebs_pid {
+	struct kobject kobj;
+	int pid;
+};
+
+static struct mtat_sysfs_pebs_pid *mtat_sysfs_pebs_pid_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_pebs_pid), GFP_KERNEL);
+}
+
+static ssize_t pebs_pid_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_pebs_pid *pebs_pid = container_of(kobj,
+			struct mtat_sysfs_pebs_pid, kobj);
+
+	return sysfs_emit(buf, "%d\n", pebs_pid->pid);
+}
+
+static ssize_t pebs_pid_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_pebs_pid *pebs_pid;
+	int pid, err;
+
+	err = kstrtoint(buf, 0, &pid);
+	if (err)
+		return err;
+	if (pid < 0)
+		return -EINVAL;
+
+	pebs_pid = container_of(kobj, struct mtat_sysfs_pebs_pid, kobj);
+	pebs_pid->pid = pid;
+
+	return count;
+}
+
+static void mtat_sysfs_pebs_pid_release(struct kobject *kobj)
+{
+	kfree(container_of(kobj, struct mtat_sysfs_pebs_pid, kobj));
+}
+
+static struct kobj_attribute mtat_sysfs_pebs_pid_pebs_pid_attr =
+		__ATTR_RW_MODE(pebs_pid, 0600);
+
+static struct attribute *mtat_sysfs_pebs_pid_attrs[] = {
+	&mtat_sysfs_pebs_pid_pebs_pid_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_pebs_pid);
+
+static const struct kobj_type mtat_sysfs_pebs_pid_ktype = {
+	.release = mtat_sysfs_pebs_pid_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_pebs_pid_groups,
+};
+
+/*
+ * pebs directory
+ */
+
+struct mtat_sysfs_pebs {
+	struct kobject kobj;
+	struct pebs_ctx *pebs_ctx;
+	struct mtat_sysfs_pebs_pid **pids;
+	int nr;
+};
+
+static struct mtat_sysfs_pebs *mtat_sysfs_pebs_alloc(void)
+{
+	return kzalloc(sizeof(struct mtat_sysfs_pebs), GFP_KERNEL);
+}
+
+static void mtat_sysfs_pebs_rm_dirs(struct mtat_sysfs_pebs *pebs)
+{
+	struct mtat_sysfs_pebs_pid **pids = pebs->pids;
+	int i;
+	for (i = 0; i < pebs->nr; i++) {
+		kobject_put(&pids[i]->kobj);
+	}
+	pebs->nr = 0;
+	kfree(pids);
+	pebs->pids = NULL;
+}
+
+static int mtat_sysfs_pebs_add_dirs(struct mtat_sysfs_pebs *pebs,
+		int nr_pids)
+{
+	struct mtat_sysfs_pebs_pid **pids, *pebs_pid;
+	int err, i;
+
+	mtat_sysfs_pebs_rm_dirs(pebs);
+	if (!nr_pids)
+		return 0;
+
+	pids = kmalloc_array(nr_pids, sizeof(*pids), GFP_KERNEL | __GFP_NOWARN);
+	if (!pids)
+		return -ENOMEM;
+	pebs->pids = pids;
+
+	for (i = 0; i < nr_pids; i++) {
+		pebs_pid = mtat_sysfs_pebs_pid_alloc();
+		if (!pebs_pid) {
+			mtat_sysfs_pebs_rm_dirs(pebs);
+			return -ENOMEM;
+		}
+		
+		err = kobject_init_and_add(&pebs_pid->kobj,
+				&mtat_sysfs_pebs_pid_ktype, &pebs->kobj,
+				"%d", i);
+		if (err)
+			goto out;
+
+		pids[i] = pebs_pid;
+		pebs->nr++;
+	}
+	return 0;
+
+out:
+	mtat_sysfs_pebs_rm_dirs(pebs);
+	kobject_put(&pebs_pid->kobj);
+	return err;
+}
+
+static bool mtat_sysfs_pebs_ctx_running(struct pebs_ctx *ctx)
+{
+	bool running = ctx->running;
+
+	return running;
+}
+
+static inline bool mtat_sysfs_pebs_running(struct mtat_sysfs_pebs *pebs)
+{
+	return pebs->pebs_ctx &&
+		mtat_sysfs_pebs_ctx_running(pebs->pebs_ctx);
+}
+
+static int mtat_sysfs_turn_pebs_on(struct mtat_sysfs_pebs *pebs)
+{
+	struct pebs_ctx *ctx;
+	struct mtat_sysfs_pebs_pid **pids = pebs->pids;
+	int err, i;
+
+	if (mtat_sysfs_pebs_running(pebs))
+		return -EBUSY;
+
+	if (pebs->pebs_ctx)
+		pebs_destroy_ctx(pebs->pebs_ctx);
+	pebs->pebs_ctx = NULL;
+
+	ctx = pebs_new_ctx(pebs->nr);
+
+	for (i = 0; i < pebs->nr; i++) {
+		ctx->pids[i] = pids[i]->pid;
+		ctx->mms[i] = ptscan_get_mm(ctx->pids[i]);
+	}
+
+	err = pebs_start(ctx);
+	if (err) {
+		pebs_destroy_ctx(ctx);
+		return err;
+	}
+	pebs->pebs_ctx = ctx;
+	return err;
+}
+
+static int mtat_sysfs_turn_pebs_off(struct mtat_sysfs_pebs *pebs)
+{
+	int err;
+	if (!pebs->pebs_ctx)
+		return -EINVAL;
+
+	err = pebs_stop(pebs->pebs_ctx);
+	if (err)
+		return err;
+
+	pebs_destroy_ctx(pebs->pebs_ctx);
+	pebs->pebs_ctx = NULL;
+	return 0;
+}
+
+static int mtat_sysfs_pebs_handle_cmd(enum mtat_sysfs_cmd cmd,
+		struct mtat_sysfs_pebs *pebs)
+{
+	switch (cmd) {
+	case MTAT_SYSFS_CMD_ON:
+		return mtat_sysfs_turn_pebs_on(pebs);
+	case MTAT_SYSFS_CMD_OFF:
+		return mtat_sysfs_turn_pebs_off(pebs);
+	default:
+		break;
+	}
+
+	return 0;
+}
+
+static ssize_t pebs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_pebs *pebs = container_of(kobj,
+			struct mtat_sysfs_pebs, kobj);
+	bool running = mtat_sysfs_pebs_running(pebs);
+
+	return sysfs_emit(buf, "%s\n", running ?
+			mtat_sysfs_cmd_strs[MTAT_SYSFS_CMD_ON] :
+			mtat_sysfs_cmd_strs[MTAT_SYSFS_CMD_OFF]);
+}
+
+static ssize_t pebs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_pebs *pebs = container_of(kobj,
+			struct mtat_sysfs_pebs, kobj);
+	enum mtat_sysfs_cmd cmd;
+	ssize_t ret = -EINVAL;
+
+	if (!mutex_trylock(&mtat_sysfs_lock))
+		return -EBUSY;
+	for (cmd = 0; cmd < NR_MTAT_SYSFS_CMDS; cmd++) {
+		if (sysfs_streq(buf, mtat_sysfs_cmd_strs[cmd])) {
+			ret = mtat_sysfs_pebs_handle_cmd(cmd, pebs);
+			break;
+		}
+	}
+	mutex_unlock(&mtat_sysfs_lock);
+	if (!ret)
+		ret = count;
+	return ret;
+}
+
+static ssize_t nr_pids_pebs_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	struct mtat_sysfs_pebs *pebs = container_of(kobj,
+			struct mtat_sysfs_pebs, kobj);
+
+	return sysfs_emit(buf, "%d\n", pebs->nr);
+}
+
+static ssize_t nr_pids_pebs_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	struct mtat_sysfs_pebs *pebs;
+	int nr, err;
+
+	err = kstrtoint(buf, 0, &nr);
+	if (err)
+		return err;
+	if (nr < 0 || nr > 8)
+		return -EINVAL;
+
+	pebs = container_of(kobj, struct mtat_sysfs_pebs, kobj);
+
+	if (!mutex_trylock(&mtat_sysfs_lock))
+		return -EBUSY;
+	err = mtat_sysfs_pebs_add_dirs(pebs, nr);
+	mutex_unlock(&mtat_sysfs_lock);
+	if (err)
+		return err;
+
+	return count;
+}
+
+static void mtat_sysfs_pebs_release(struct kobject *kobj)
+{
+	kfree(container_of(kobj, struct mtat_sysfs_pebs, kobj));
+}
+
+static struct kobj_attribute mtat_sysfs_pebs_pebs_attr =
+		__ATTR_RW_MODE(pebs, 0600);
+
+static struct kobj_attribute mtat_sysfs_pebs_nr_pids_pebs_attr =
+		__ATTR_RW_MODE(nr_pids_pebs, 0600);
+
+static struct attribute *mtat_sysfs_pebs_attrs[] = {
+	&mtat_sysfs_pebs_pebs_attr.attr,
+	&mtat_sysfs_pebs_nr_pids_pebs_attr.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mtat_sysfs_pebs);
+
+static const struct kobj_type mtat_sysfs_pebs_ktype = {
+	.release = mtat_sysfs_pebs_release,
+	.sysfs_ops = &kobj_sysfs_ops,
+	.default_groups = mtat_sysfs_pebs_groups,
 };
 
 /*
@@ -226,25 +528,6 @@ static const struct kobj_type mtat_sysfs_kmigrated_pid_ktype = {
 	.release = mtat_sysfs_kmigrated_pid_release,
 	.sysfs_ops = &kobj_sysfs_ops,
 	.default_groups = mtat_sysfs_kmigrated_pid_groups,
-};
-
-
-/*
- * enum mtat_sysfs_cmd - Commands for a specific kptscand/kmigrated.
- */
-enum mtat_sysfs_cmd {
-	/* @MTAT_SYSFS_CMD_ON: Turn the kptscand/kmigrated on. */
-	MTAT_SYSFS_CMD_ON,
-	/* @MTAT_SYSFS_CMD_OFF: Turn the kptscand/kmigrated off. */
-	MTAT_SYSFS_CMD_OFF,
-	/* @NR_MTAT_SYSFS_CMDS: Total number of MTAT sysfs commands. */
-	NR_MTAT_SYSFS_CMDS,
-};
-
-/* Should match with enum mtat_sysfs_cmd */
-static const char * const mtat_sysfs_cmd_strs[] = {
-	"on",
-	"off",
 };
 
 /*
@@ -814,6 +1097,7 @@ static const struct kobj_type mtat_sysfs_kptscands_ktype = {
 struct mtat_sysfs_ui_dir {
 	struct kobject kobj;
 	struct mtat_sysfs_kptscands *kptscands;
+	struct mtat_sysfs_pebs *pebs;
 	struct mtat_sysfs_kmigrated *kmigrated;
 	struct mtat_sysfs_setting *setting;
 };
@@ -828,6 +1112,7 @@ static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
 	struct mtat_sysfs_kptscands *kptscands;
 	struct mtat_sysfs_kmigrated *kmigrated;
 	struct mtat_sysfs_setting *setting;
+	struct mtat_sysfs_pebs *pebs;
 	int err;
 
 	kptscands = mtat_sysfs_kptscands_alloc();
@@ -861,19 +1146,33 @@ static int mtat_sysfs_ui_dir_add_dirs(struct mtat_sysfs_ui_dir *ui_dir)
 	if (err)
 		goto put_setting;
 
+	pebs = mtat_sysfs_pebs_alloc();
+	if (!pebs) {
+		err = -ENOMEM;
+		goto put_setting;
+	}
+	err = kobject_init_and_add(&pebs->kobj,
+			&mtat_sysfs_pebs_ktype, &ui_dir->kobj,
+			"pebs");
+	if (err)
+		goto put_pebs;
+
 	ui_dir->kptscands = kptscands;
 	ui_dir->kmigrated = kmigrated;
 	ui_dir->setting = setting;
-	
+	ui_dir->pebs = pebs;	
+
 	return err;
 
+put_pebs:
+	kobject_put(&pebs->kobj);
 put_setting:
 	kobject_put(&setting->kobj);
 put_kmigrated:
 	kobject_put(&kmigrated->kobj);
 put_kptscands:
 	kobject_put(&kptscands->kobj);
-out:
+
 	return err;
 }
 

@@ -29,8 +29,8 @@
 
 // ptscan 내부 전역 변수 count table로 pfn들의 access count를 저장.
 // kptscand 들끼리 공유함, 따라서 ptscan_lock으로 보호 필요.
-struct rhashtable *count_table = NULL;
-struct rhashtable_params params = {
+static struct rhashtable *count_table = NULL;
+static struct rhashtable_params params = {
 	.head_offset = offsetof(struct access_counter, node),
 	.key_offset = offsetof(struct access_counter, pfn),
 	.key_len = sizeof(unsigned long),
@@ -63,7 +63,6 @@ void ptscan_destroy_ctx(struct ptscan_ctx *ctx)
 }
 
 static int kptscand_fn(void *data);
-static struct bucket_sort **alloc_bucket_sort_array(void);
 
 int ptscan_start(struct ptscan_ctx *ctx)
 {
@@ -162,14 +161,14 @@ int ptscan_stop(struct ptscan_ctx *ctx)
 /* 
  * access_counter structure's methods
  */
-static struct access_counter *new_access_counter(unsigned long pfn, struct mm_struct *mm)
+struct access_counter *new_access_counter(unsigned long pfn, struct mm_struct *mm)
 {
 	struct access_counter *counter = NULL;
 	if (node_state(1, N_MEMORY)) {
 		//pr_err("allocate from PMEM\n");
 		counter = kmalloc_node(sizeof(*counter), GFP_NOWAIT, 1);
 	} else {
-		pr_err("allocate from DRAM\n");
+		//pr_err("allocate from DRAM\n");
 		counter = kmalloc(sizeof(*counter), GFP_NOWAIT);
 	}
 	if (!counter)
@@ -189,7 +188,7 @@ void destroy_access_counter(struct access_counter *counter)
 	kfree(counter);
 }
 
-static void inc_access_counter(struct access_counter *counter)
+void inc_access_counter(struct access_counter *counter)
 {
 	if (counter->count < MAX_ACCESS_COUNTER_VALUE)
 		counter->count++;
@@ -238,7 +237,7 @@ void bucket_init(struct bucket_sort *bucket_sort)
 	}
 }
 
-static struct bucket_sort **alloc_bucket_sort_array(void)
+struct bucket_sort **alloc_bucket_sort_array(void)
 {
 	struct bucket_sort **bucket_sort_arr = NULL;
 	if (node_state(1, N_MEMORY)) {
@@ -264,7 +263,7 @@ static struct bucket_sort **alloc_bucket_sort_array(void)
 	return bucket_sort_arr;
 }
 
-static void destroy_bucket_sort_array(struct bucket_sort **bucket_sort_arr)
+void destroy_bucket_sort_array(struct bucket_sort **bucket_sort_arr)
 {
 	destroy_bucket_sort(bucket_sort_arr[0]);
 	destroy_bucket_sort(bucket_sort_arr[1]);
@@ -369,6 +368,16 @@ unsigned long bucket_cold_size(struct bucket_sort *bucket_sort)
 	}
 
 	return count;
+}
+
+void print_bucket_sort_array(struct bucket_sort **bucket_sort_arr)
+{
+	for (int nid = 0; nid < 2; nid++) {
+		pr_info("NODE %d:\n", nid);
+		for (int i = 0; i < NR_BUCKETS; i++) {
+			pr_info("-- bucket[%d] count: %lu\n", i, bucket_sort_arr[nid]->counts[i]);
+		}
+	}
 }
 
 /* 
@@ -489,12 +498,7 @@ static void mm_ptscan(struct mm_struct *mm)
 	pr_info("-- elapsed time (s): %lu/%u", elapsed, HZ);
 
 	spin_lock_irqsave(&mm->bucket_lock, flags);
-	for (int nid = 0; nid < 2; nid++) {
-		pr_info("NODE %d:\n", nid);
-		for (int i = 0; i < NR_BUCKETS; i++) {
-			pr_info("-- bucket[%d] count: %lu\n", i, mm->bucket_sort_arr[nid]->counts[i]);
-		}
-	}
+	print_bucket_sort_array(mm->bucket_sort_arr);
 	spin_unlock_irqrestore(&mm->bucket_lock, flags);
 }
 

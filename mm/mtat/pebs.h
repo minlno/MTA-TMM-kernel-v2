@@ -1,0 +1,5 @@
+#define PMEM_READ 0x80d1
+#define DRAM_READ 0x01d3
+#define STORE_ALL 0x82d0
+
+#define SAMPLE_PERIOD_PEBS 10007

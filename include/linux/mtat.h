@@ -20,6 +20,24 @@ extern int hot_threshold;
 extern int cool_threshold;
 
 /*
+ * PEBS
+ */
+
+struct pebs_ctx {
+	struct mutex pebs_lock;
+	bool running;
+	int nr;
+	int *pids;
+	struct mm_struct **mms;
+};
+struct pebs_ctx *pebs_new_ctx(int nr_pids);
+void pebs_destroy_ctx(struct pebs_ctx *ctx);
+
+int pebs_start(struct pebs_ctx *ctx);
+int pebs_stop(struct pebs_ctx *ctx);
+
+
+/*
  * PTSCAN
  */
 struct access_counter;
@@ -55,7 +73,12 @@ struct bucket_sort {
 	unsigned long counts[NR_BUCKETS];
 	struct list_head buckets[NR_BUCKETS];
 };
+
+void inc_access_counter(struct access_counter *counter);
+struct access_counter *new_access_counter(unsigned long pfn, struct mm_struct *mm);
 void destroy_access_counter(struct access_counter *counter);
+struct bucket_sort **alloc_bucket_sort_array(void);
+void destroy_bucket_sort_array(struct bucket_sort **bucket_sort_arr);
 void bucket_init_array(struct bucket_sort **bucket_sort_arr);
 void bucket_remove_page(struct page *page);
 void bucket_remove_counter(struct bucket_sort *bucket_sort, struct access_counter *counter);
@@ -63,6 +86,7 @@ void bucket_insert_counter(struct bucket_sort *bucket_sort, struct access_counte
 void bucket_reinsert(struct bucket_sort *bucket_sort, struct access_counter *counter);
 unsigned long bucket_hot_size(struct bucket_sort *bucket_sort);
 unsigned long bucket_cold_size(struct bucket_sort *bucket_sort);
+void print_bucket_sort_array(struct bucket_sort **bucket_sort_arr);
 
 /*
  * MIGRATE
